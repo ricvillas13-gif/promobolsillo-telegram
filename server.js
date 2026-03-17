@@ -1364,7 +1364,6 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true, service: "promobolsillo-telegram", now: nowISO() });
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Promobolsillo+ Telegram escuchando en puerto ${PORT}`);
 });
-
