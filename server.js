@@ -1322,6 +1322,7 @@ app.post("/telegram/webhook", async (req, res) => {
   }
 
   const incoming = parseTelegramUpdate(req.body || {});
+  console.log("Telegram senderHandle:", incoming.senderHandle, "text:", incoming.text);
   if (!incoming.senderHandle) {
     res.json({ ok: true, ignored: true });
     return;
