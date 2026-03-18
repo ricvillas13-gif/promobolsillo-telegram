@@ -40,8 +40,20 @@ const TELEGRAM_API = TELEGRAM_BOT_TOKEN
   : "";
 
 const app = express();
-app.use(bodyParser.json({ limit: "30mb" }));
+app.use(bodyParser.json({ limit: "20mb" }));
 app.use(bodyParser.urlencoded({ extended: false }));
+
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Headers", "Content-Type");
+  res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+
+  next();
+});
 
 function norm(value) {
   return (value || "").toString().trim();
