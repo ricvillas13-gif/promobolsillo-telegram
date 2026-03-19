@@ -43,9 +43,21 @@ const app = express();
 app.use(bodyParser.json({ limit: "20mb" }));
 app.use(bodyParser.urlencoded({ extended: false }));
 
+const ALLOWED_ORIGINS = [
+  MINIAPP_BASE_URL,
+  "http://localhost:5173",
+  "https://localhost:5173",
+].filter(Boolean);
+
 app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Headers", "Content-Type");
+  const origin = req.headers.origin;
+
+  if (origin && ALLOWED_ORIGINS.includes(origin)) {
+    res.header("Access-Control-Allow-Origin", origin);
+  }
+
+  res.header("Vary", "Origin");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
 
   if (req.method === "OPTIONS") {
@@ -468,7 +480,7 @@ async function getEvidenciasByVisitId(visita_id) {
 async function registrarEvidencia(payload) {
   await appendSheetValues("EVIDENCIAS!A2:Q", [[
     payload.evidencia_id,
-    payload.external_id,
+    payload.external_id || payload.telefono || "",
     nowISO(),
     payload.tipo_evento,
     payload.origen,
@@ -842,11 +854,32 @@ async function resolveActorFromInitData(initData) {
 async function requireMiniAppActor(req, res, next) {
   try {
     const initData = req.body?.initData || req.headers["x-telegram-init-data"] || req.query?.initData;
+
+    console.log("MiniApp auth start", {
+      origin: req.headers.origin || "",
+      referer: req.headers.referer || "",
+      hasInitData: Boolean(initData),
+      initDataLength: initData ? String(initData).length : 0,
+    });
+
     const actor = await resolveActorFromInitData(initData);
+
     if (!actor) {
+      console.warn("MiniApp auth rejected", {
+        origin: req.headers.origin || "",
+        referer: req.headers.referer || "",
+        hasInitData: Boolean(initData),
+      });
       res.status(401).json({ ok: false, error: "initData inválido" });
       return;
     }
+
+    console.log("MiniApp auth ok", {
+      role: actor.role,
+      externalId: actor.externalId,
+      telegramUserId: actor.telegramUser?.id || null,
+    });
+
     req.miniappActor = actor;
     next();
   } catch (error) {
@@ -857,6 +890,13 @@ async function requireMiniAppActor(req, res, next) {
 
 app.post("/miniapp/bootstrap", requireMiniAppActor, async (req, res) => {
   const actor = req.miniappActor;
+
+  console.log("miniapp/bootstrap ok", {
+    role: actor.role,
+    externalId: actor.externalId,
+    telegramUserId: actor.telegramUser?.id || null,
+  });
+
   res.json({
     ok: true,
     role: actor.role,
