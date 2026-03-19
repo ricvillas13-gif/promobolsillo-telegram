@@ -7,7 +7,7 @@ import { google } from "googleapis";
  * Promobolsillo+ Telegram Backend v2
  *
  * Paso largo:
- * - Backend ya aterrizado para Telegram.
+ * - Backend ya aterrizado para Telegram
  * - Google Sheets como fuente de verdad.
  * - Mini App con endpoints reales para promotor, supervisor y cliente.
  * - Canal Telegram separado de la lógica de negocio.
