@@ -968,6 +968,12 @@ async function requireMiniAppActor(req, res, next) {
   }
 }
 
+function asyncHandler(fn) {
+  return (req, res, next) => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
+}
+
 function buildEvidenceView(item, marcaMap, visitMap, tiendaMap) {
   const visit = visitMap[item.visita_id];
   const tienda = visit ? tiendaMap[visit.tienda_id] : null;
@@ -1045,7 +1051,7 @@ app.post("/miniapp/promotor/dashboard", requireMiniAppActor, async (req, res) =>
   });
 });
 
-app.post("/miniapp/promotor/start-entry", requireMiniAppActor, async (req, res) => {
+app.post("/miniapp/promotor/start-entry", requireMiniAppActor, asyncHandler(async (req, res) => {
   const actor = req.miniappActor;
   if (actor.role !== "promotor") {
     res.status(403).json({ ok: false, error: "solo_promotor" });
@@ -1109,9 +1115,9 @@ app.post("/miniapp/promotor/start-entry", requireMiniAppActor, async (req, res) 
     tienda_nombre: storeMap[tienda_id]?.nombre_tienda || tienda_id,
     started_at: nowISO(),
   });
-});
+}));
 
-app.post("/miniapp/promotor/close-visit", requireMiniAppActor, async (req, res) => {
+app.post("/miniapp/promotor/close-visit", requireMiniAppActor, asyncHandler(async (req, res) => {
   const actor = req.miniappActor;
   if (actor.role !== "promotor") {
     res.status(403).json({ ok: false, error: "solo_promotor" });
@@ -1167,7 +1173,7 @@ app.post("/miniapp/promotor/close-visit", requireMiniAppActor, async (req, res) 
   }
 
   res.json({ ok: true, visita_id, closed_at: nowISO() });
-});
+}));
 
 app.post("/miniapp/promotor/evidence-context", requireMiniAppActor, async (req, res) => {
   const actor = req.miniappActor;
@@ -1221,7 +1227,7 @@ app.post("/miniapp/promotor/evidence-rules", requireMiniAppActor, async (req, re
   res.json({ ok: true, reglas });
 });
 
-app.post("/miniapp/promotor/evidence-register", requireMiniAppActor, async (req, res) => {
+app.post("/miniapp/promotor/evidence-register", requireMiniAppActor, asyncHandler(async (req, res) => {
   const actor = req.miniappActor;
   if (actor.role !== "promotor") {
     res.status(403).json({ ok: false, error: "solo_promotor" });
@@ -1321,9 +1327,9 @@ app.post("/miniapp/promotor/evidence-register", requireMiniAppActor, async (req,
     created,
     count: created.length,
   });
-});
+}));
 
-app.post("/miniapp/promotor/evidences-today", requireMiniAppActor, async (req, res) => {
+app.post("/miniapp/promotor/evidences-today", requireMiniAppActor, asyncHandler(async (req, res) => {
   const actor = req.miniappActor;
   if (actor.role !== "promotor") {
     res.status(403).json({ ok: false, error: "solo_promotor" });
@@ -1339,9 +1345,9 @@ app.post("/miniapp/promotor/evidences-today", requireMiniAppActor, async (req, r
     ok: true,
     evidencias: evidencias.map((item) => buildEvidenceView(item, marcaMap, visitMap, tiendaMap)),
   });
-});
+}));
 
-app.post("/miniapp/promotor/evidence-note", requireMiniAppActor, async (req, res) => {
+app.post("/miniapp/promotor/evidence-note", requireMiniAppActor, asyncHandler(async (req, res) => {
   const actor = req.miniappActor;
   if (actor.role !== "promotor") {
     res.status(403).json({ ok: false, error: "solo_promotor" });
@@ -1365,9 +1371,9 @@ app.post("/miniapp/promotor/evidence-note", requireMiniAppActor, async (req, res
   });
 
   res.json({ ok: true, evidencia_id, note });
-});
+}));
 
-app.post("/miniapp/promotor/cancel-evidence", requireMiniAppActor, async (req, res) => {
+app.post("/miniapp/promotor/cancel-evidence", requireMiniAppActor, asyncHandler(async (req, res) => {
   const actor = req.miniappActor;
   if (actor.role !== "promotor") {
     res.status(403).json({ ok: false, error: "solo_promotor" });
@@ -1392,9 +1398,9 @@ app.post("/miniapp/promotor/cancel-evidence", requireMiniAppActor, async (req, r
   });
 
   res.json({ ok: true, evidencia_id, status: "ANULADA" });
-});
+}));
 
-app.post("/miniapp/promotor/replace-evidence", requireMiniAppActor, async (req, res) => {
+app.post("/miniapp/promotor/replace-evidence", requireMiniAppActor, asyncHandler(async (req, res) => {
   const actor = req.miniappActor;
   if (actor.role !== "promotor") {
     res.status(403).json({ ok: false, error: "solo_promotor" });
@@ -1439,7 +1445,7 @@ app.post("/miniapp/promotor/replace-evidence", requireMiniAppActor, async (req, 
   });
 
   res.json({ ok: true, evidencia_id, replaced: true });
-});
+}));
 
 app.post("/miniapp/supervisor/dashboard", requireMiniAppActor, async (req, res) => {
   const actor = req.miniappActor;
@@ -1685,6 +1691,24 @@ app.get("/", (_req, res) => {
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true, service: "promobolsillo-telegram", now: nowISO() });
+});
+
+app.use((error, req, res, _next) => {
+  console.error("Unhandled route error", {
+    path: req.path,
+    method: req.method,
+    message: error?.message || String(error),
+    stack: error?.stack || "",
+  });
+  res.status(500).json({ ok: false, error: error?.message || "server_error" });
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("UNHANDLED_REJECTION", reason);
+});
+
+process.on("uncaughtException", (error) => {
+  console.error("UNCAUGHT_EXCEPTION", error);
 });
 
 app.listen(PORT, "0.0.0.0", () => {
