@@ -24,9 +24,6 @@ import { google } from "googleapis";
  * O producto_id
  * P tipo_evidencia
  * Q descripción
- *
- * No requiere agregar columnas nuevas hoy.
- * Los extras de Telegram se resuelven sin romper tu esquema viejo.
  */
 
 const {
@@ -126,11 +123,6 @@ function buildBaseUrl(req) {
 
 function buildTelegramExternalId(telegramUserId) {
   return `telegram:${telegramUserId}`;
-}
-
-function nEmoji(index) {
-  const arr = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"];
-  return arr[index] || `${index + 1})`;
 }
 
 function unique(arr) {
@@ -322,9 +314,7 @@ async function getTiendaMap() {
 
 async function getTiendasAsignadas(promotor_id) {
   const rows = await getSheetValues("ASIGNACIONES!A2:D");
-  return unique(
-    rows.filter((row) => norm(row[0]) === promotor_id && isTrue(row[3] ?? "TRUE")).map((row) => norm(row[1]))
-  );
+  return unique(rows.filter((row) => norm(row[0]) === promotor_id && isTrue(row[3] ?? "TRUE")).map((row) => norm(row[1])));
 }
 
 async function getVisitasAllByPromotor(promotor_id) {
@@ -554,10 +544,7 @@ async function resolveActor(externalId) {
   if (supervisor) return { role: "supervisor", profile: supervisor };
   const promotor = await getPromotorByExternalId(externalId);
   if (promotor) return { role: "promotor", profile: promotor };
-  return {
-    role: "cliente",
-    profile: { external_id: externalId, nombre: "Cliente" },
-  };
+  return { role: "cliente", profile: { external_id: externalId, nombre: "Cliente" } };
 }
 
 function parseTelegramUpdate(update) {
@@ -670,125 +657,29 @@ function buildClienteKeyboard() {
   };
 }
 
-function mainMenu(hasPending = false) {
-  const extra = hasPending ? `\n*${nEmoji(5)}* Continuar evidencia pendiente ⏯️` : "";
-  return (
-    "👋 *Promobolsillo+ Telegram*\n\n" +
-    `*${nEmoji(0)}* Asistencia\n` +
-    `*${nEmoji(1)}* Evidencias\n` +
-    `*${nEmoji(2)}* Mis evidencias\n` +
-    `*${nEmoji(3)}* Resumen del día\n` +
-    `*${nEmoji(4)}* Ayuda\n` +
-    extra +
-    "\n\nAtajos: /menu /activas /continuar /ayuda"
-  );
-}
-
 async function handlePromotorChannel(actor, incoming, session) {
   const text = norm(incoming.text).toLowerCase();
   const data = session.data_json || {};
 
   if (text === "/start" || text === "/menu" || text === "menu") {
     await setSession(actor.profile.external_id, STATE_MENU, data);
-    return { type: "text", text: mainMenu(Boolean(data?._pending_evid)), reply_markup: buildPromotorKeyboard() };
+    return { type: "text", text: "Menú promotor", reply_markup: buildPromotorKeyboard() };
   }
 
-  if (incoming.updateType === "callback_query") {
-    if (text === "promo:asis") {
-      const openVisits = await getOpenVisitsToday(actor.profile.promotor_id);
-      return {
-        type: "text",
-        text:
-          `🕒 *Asistencia*\n\n` +
-          `Visitas abiertas HOY: *${openVisits.length}*\n` +
-          "Abre la Mini App para registrar entrada/salida con foto, GPS y validación guiada.",
-        reply_markup: { inline_keyboard: [[{ text: "Abrir asistencia", web_app: { url: MINIAPP_BASE_URL || "https://example.com" } }]] },
-      };
-    }
-
-    if (text === "promo:evid") {
-      return {
-        type: "text",
-        text: "📸 *Evidencias*\n\nLa captura fuerte vive en la Mini App para controlar tamaño, peso y orden de envío.",
-        reply_markup: { inline_keyboard: [[{ text: "Abrir captura", web_app: { url: MINIAPP_BASE_URL || "https://example.com" } }]] },
-      };
-    }
-
-    if (text === "promo:my_evid") {
-      const evidencias = await getEvidenciasTodayByExternalId(actor.profile.external_id);
-      return {
-        type: "text",
-        text: `📚 *Mis evidencias de hoy*: *${evidencias.length}*\n\nAbre la Mini App para ver galería, reemplazar o anular.`,
-        reply_markup: { inline_keyboard: [[{ text: "Abrir galería", web_app: { url: MINIAPP_BASE_URL || "https://example.com" } }]] },
-      };
-    }
-
-    if (text === "promo:summary") {
-      const visits = await getVisitasToday(actor.profile.promotor_id);
-      const open = visits.filter((v) => !v.hora_fin).length;
-      const closed = visits.filter((v) => v.hora_fin).length;
-      const evidencias = await getEvidenciasTodayByExternalId(actor.profile.external_id);
-      return {
-        type: "text",
-        text:
-          `📊 *Resumen del día* (${todayISO()})\n\n` +
-          `🏬 Visitas: *${visits.length}*\n` +
-          `🟢 Abiertas: *${open}*\n` +
-          `✅ Cerradas: *${closed}*\n` +
-          `📸 Evidencias: *${evidencias.length}*`,
-      };
-    }
-  }
-
-  return { type: "text", text: mainMenu(Boolean(data?._pending_evid)), reply_markup: buildPromotorKeyboard() };
+  return { type: "text", text: "Menú promotor", reply_markup: buildPromotorKeyboard() };
 }
 
 async function handleSupervisorChannel(actor, incoming, session) {
   const text = norm(incoming.text).toLowerCase();
-
   if (text === "/start" || text === "/menu" || text === "/sup" || text === "sup") {
     await setSession(actor.profile.external_id, STATE_SUP_MENU, session.data_json || {});
-    return {
-      type: "text",
-      text: `👋 Hola, *${actor.profile.nombre}* (Supervisor).\n\nTu panel ya corre sobre Telegram.`,
-      reply_markup: buildSupervisorKeyboard(),
-    };
+    return { type: "text", text: `👋 Hola, *${actor.profile.nombre}* (Supervisor).`, reply_markup: buildSupervisorKeyboard() };
   }
-
-  if (incoming.updateType === "callback_query") {
-    switch (text) {
-      case "sup:asis": {
-        const equipo = await getPromotoresDeSupervisor(actor.profile.external_id);
-        return {
-          type: "text",
-          text: `🧑‍🤝‍🧑 Equipo detectado: *${equipo.length}* promotor(es).\n\nAbre el panel para ver asistencias HOY y detalle por visita.`,
-          reply_markup: { inline_keyboard: [[{ text: "Abrir panel supervisor", web_app: { url: MINIAPP_BASE_URL || "https://example.com" } }]] },
-        };
-      }
-      case "sup:alerts":
-        return { type: "text", text: "🚦 Alertas del día listas para consultarse en el panel supervisor.", reply_markup: { inline_keyboard: [[{ text: "Abrir alertas", web_app: { url: MINIAPP_BASE_URL || "https://example.com" } }]] } };
-      case "sup:evid":
-        return { type: "text", text: "📷 Evidencias del equipo listas para revisión fotográfica dentro de la Mini App.", reply_markup: { inline_keyboard: [[{ text: "Abrir revisión", web_app: { url: MINIAPP_BASE_URL || "https://example.com" } }]] } };
-      case "sup:cart":
-        return { type: "text", text: "🛒 El carrito ya se puede modelar desde el panel supervisor y luego publicar al cliente Telegram." };
-      default:
-        break;
-    }
-  }
-
-  return { type: "text", text: `👋 Hola, *${actor.profile.nombre}* (Supervisor).\n\nUsa el menú para continuar.`, reply_markup: buildSupervisorKeyboard() };
+  return { type: "text", text: `👋 Hola, *${actor.profile.nombre}* (Supervisor).`, reply_markup: buildSupervisorKeyboard() };
 }
 
-async function handleClienteChannel(_actor, incoming) {
-  const text = norm(incoming.text).toLowerCase();
-  if (text === "/start" || text === "/menu" || text === "menu") {
-    return {
-      type: "text",
-      text: "👋 *Canal cliente*\n\nAquí recibirás visitas aprobadas, fotos clave y acceso al expediente completo dentro de Telegram.",
-      reply_markup: buildClienteKeyboard(),
-    };
-  }
-  return { type: "text", text: "Escribe /menu para abrir tu panel cliente.", reply_markup: buildClienteKeyboard() };
+async function handleClienteChannel() {
+  return { type: "text", text: "Canal cliente", reply_markup: buildClienteKeyboard() };
 }
 
 async function routeIncoming(incoming) {
@@ -855,18 +746,6 @@ async function requireMiniAppActor(req, res, next) {
 function asyncHandler(fn) {
   return (req, res, next) => {
     Promise.resolve(fn(req, res, next)).catch(next);
-  };
-}
-
-function buildEvidenceView(item, marcaMap, visitMap, tiendaMap) {
-  const visit = visitMap[item.visita_id];
-  const tienda = visit ? tiendaMap[visit.tienda_id] : null;
-  return {
-    ...item,
-    marca_nombre: marcaMap[item.marca_id]?.marca_nombre || item.marca_id,
-    fecha_hora_fmt: fmtDateTimeTZ(item.fecha_hora),
-    tienda_id: visit?.tienda_id || "",
-    tienda_nombre: tienda?.nombre_tienda || visit?.tienda_id || "",
   };
 }
 
@@ -1003,15 +882,10 @@ app.post("/miniapp/promotor/close-visit", requireMiniAppActor, asyncHandler(asyn
 app.post("/miniapp/promotor/evidence-context", requireMiniAppActor, asyncHandler(async (req, res) => {
   const actor = req.miniappActor;
   if (actor.role !== "promotor") return res.status(403).json({ ok: false, error: "solo_promotor" });
-
   const { visita_id } = req.body || {};
   if (!visita_id) return res.status(400).json({ ok: false, error: "visita_id requerido" });
-
   const visit = await getVisitById(visita_id);
-  if (!visit || visit.promotor_id !== actor.profile.promotor_id) {
-    return res.status(404).json({ ok: false, error: "visita_no_encontrada" });
-  }
-
+  if (!visit || visit.promotor_id !== actor.profile.promotor_id) return res.status(404).json({ ok: false, error: "visita_no_encontrada" });
   const marcas = await getMarcasActivas();
   const storeMap = await getTiendaMap();
   res.json({ ok: true, visita: { ...visit, tienda_nombre: storeMap[visit.tienda_id]?.nombre_tienda || visit.tienda_id }, marcas });
@@ -1020,12 +894,10 @@ app.post("/miniapp/promotor/evidence-context", requireMiniAppActor, asyncHandler
 app.post("/miniapp/promotor/evidence-rules", requireMiniAppActor, asyncHandler(async (req, res) => {
   const actor = req.miniappActor;
   if (actor.role !== "promotor") return res.status(403).json({ ok: false, error: "solo_promotor" });
-
   const { marca_id, marca_nombre = "" } = req.body || {};
   let resolvedMarcaId = norm(marca_id);
   if (!resolvedMarcaId && marca_nombre) resolvedMarcaId = await resolveMarcaIdByName(marca_nombre);
   if (!resolvedMarcaId) return res.status(400).json({ ok: false, error: "marca_id requerido" });
-
   const reglas = await getReglasPorMarca(resolvedMarcaId);
   res.json({ ok: true, reglas });
 }));
@@ -1034,25 +906,11 @@ app.post("/miniapp/promotor/evidence-register", requireMiniAppActor, asyncHandle
   const actor = req.miniappActor;
   if (actor.role !== "promotor") return res.status(403).json({ ok: false, error: "solo_promotor" });
 
-  const {
-    visita_id,
-    marca_id = "",
-    marca_nombre = "",
-    tipo_evidencia,
-    descripcion = "",
-    lat = "",
-    lon = "",
-    fotos = [],
-    foto_data_url = "",
-    foto_nombre = "",
-  } = req.body || {};
-
+  const { visita_id, marca_id = "", marca_nombre = "", tipo_evidencia, descripcion = "", lat = "", lon = "", fotos = [], foto_data_url = "", foto_nombre = "" } = req.body || {};
   if (!visita_id || !tipo_evidencia) return res.status(400).json({ ok: false, error: "payload_incompleto" });
 
   const visit = await getVisitById(visita_id);
-  if (!visit || visit.promotor_id !== actor.profile.promotor_id) {
-    return res.status(404).json({ ok: false, error: "visita_no_encontrada" });
-  }
+  if (!visit || visit.promotor_id !== actor.profile.promotor_id) return res.status(404).json({ ok: false, error: "visita_no_encontrada" });
 
   let resolvedMarcaId = norm(marca_id);
   if (!resolvedMarcaId && marca_nombre) resolvedMarcaId = await resolveMarcaIdByName(marca_nombre);
@@ -1100,27 +958,20 @@ app.post("/miniapp/promotor/evidence-register", requireMiniAppActor, asyncHandle
 app.post("/miniapp/promotor/evidences-today", requireMiniAppActor, asyncHandler(async (req, res) => {
   const actor = req.miniappActor;
   if (actor.role !== "promotor") return res.status(403).json({ ok: false, error: "solo_promotor" });
-
   const marcaMap = await getMarcaMap();
   const visitMap = await getAllVisitsMap();
   const tiendaMap = await getTiendaMap();
   const evidencias = await getEvidenciasTodayByExternalId(actor.profile.external_id);
-
   res.json({ ok: true, evidencias: evidencias.map((item) => buildEvidenceView(item, marcaMap, visitMap, tiendaMap)) });
 }));
 
 app.post("/miniapp/promotor/evidence-note", requireMiniAppActor, asyncHandler(async (req, res) => {
   const actor = req.miniappActor;
   if (actor.role !== "promotor") return res.status(403).json({ ok: false, error: "solo_promotor" });
-
   const { evidencia_id, note = "" } = req.body || {};
   if (!evidencia_id) return res.status(400).json({ ok: false, error: "evidencia_id requerido" });
-
   const evidence = await getEvidenceById(evidencia_id);
-  if (!evidence || evidence.external_id !== actor.profile.external_id) {
-    return res.status(404).json({ ok: false, error: "evidencia_no_encontrada" });
-  }
-
+  if (!evidence || evidence.external_id !== actor.profile.external_id) return res.status(404).json({ ok: false, error: "evidencia_no_encontrada" });
   const newDescription = note ? `${evidence.descripcion} | Nota: ${note}`.slice(0, 50000) : evidence.descripcion;
   await updateEvidenceRow(evidence, { descripcion: newDescription });
   res.json({ ok: true, evidencia_id, note });
@@ -1129,15 +980,10 @@ app.post("/miniapp/promotor/evidence-note", requireMiniAppActor, asyncHandler(as
 app.post("/miniapp/promotor/cancel-evidence", requireMiniAppActor, asyncHandler(async (req, res) => {
   const actor = req.miniappActor;
   if (actor.role !== "promotor") return res.status(403).json({ ok: false, error: "solo_promotor" });
-
   const { evidencia_id, note = "" } = req.body || {};
   if (!evidencia_id) return res.status(400).json({ ok: false, error: "evidencia_id requerido" });
-
   const evidence = await getEvidenceById(evidencia_id);
-  if (!evidence || evidence.external_id !== actor.profile.external_id) {
-    return res.status(404).json({ ok: false, error: "evidencia_no_encontrada" });
-  }
-
+  if (!evidence || evidence.external_id !== actor.profile.external_id) return res.status(404).json({ ok: false, error: "evidencia_no_encontrada" });
   const newDescription = `[ANULADA] ${evidence.descripcion || ""}${note ? ` | Motivo: ${note}` : ""}`.slice(0, 50000);
   await updateEvidenceRow(evidence, { descripcion: newDescription, riesgo: "BAJO", resultado_ai: "ANULADA_MANUAL" });
   res.json({ ok: true, evidencia_id, status: "ANULADA" });
@@ -1146,36 +992,21 @@ app.post("/miniapp/promotor/cancel-evidence", requireMiniAppActor, asyncHandler(
 app.post("/miniapp/promotor/replace-evidence", requireMiniAppActor, asyncHandler(async (req, res) => {
   const actor = req.miniappActor;
   if (actor.role !== "promotor") return res.status(403).json({ ok: false, error: "solo_promotor" });
-
   const { evidencia_id, url_foto = "", foto_data_url = "", resultado_ai = "", score_confianza = "", riesgo = "" } = req.body || {};
   if (!evidencia_id) return res.status(400).json({ ok: false, error: "evidencia_id requerido" });
-
   const evidence = await getEvidenceById(evidencia_id);
-  if (!evidence || evidence.external_id !== actor.profile.external_id) {
-    return res.status(404).json({ ok: false, error: "evidencia_no_encontrada" });
-  }
-
+  if (!evidence || evidence.external_id !== actor.profile.external_id) return res.status(404).json({ ok: false, error: "evidencia_no_encontrada" });
   const newPhotoUrl = url_foto || foto_data_url;
   if (!newPhotoUrl) return res.status(400).json({ ok: false, error: "foto_requerida" });
-
-  await updateEvidenceRow(evidence, {
-    url_foto: newPhotoUrl,
-    fecha_hora: nowISO(),
-    resultado_ai: resultado_ai || evidence.resultado_ai,
-    score_confianza: score_confianza || evidence.score_confianza,
-    riesgo: riesgo || evidence.riesgo,
-  });
-
+  await updateEvidenceRow(evidence, { url_foto: newPhotoUrl, fecha_hora: nowISO(), resultado_ai: resultado_ai || evidence.resultado_ai, score_confianza: score_confianza || evidence.score_confianza, riesgo: riesgo || evidence.riesgo });
   res.json({ ok: true, evidencia_id, replaced: true });
 }));
 
 app.post("/miniapp/supervisor/dashboard", requireMiniAppActor, asyncHandler(async (req, res) => {
   const actor = req.miniappActor;
   if (actor.role !== "supervisor") return res.status(403).json({ ok: false, error: "solo_supervisor" });
-
   const equipo = await getPromotoresDeSupervisor(actor.profile.external_id);
   const byPromotor = [];
-
   for (const promotor of equipo) {
     const visits = await getVisitasToday(promotor.promotor_id);
     const evidencias = await getEvidenciasTodayByExternalId(promotor.external_id);
@@ -1190,136 +1021,67 @@ app.post("/miniapp/supervisor/dashboard", requireMiniAppActor, asyncHandler(asyn
       alertas_riesgo: evidencias.filter((item) => item.riesgo === "ALTO" || item.riesgo === "MEDIO").length,
     });
   }
-
-  res.json({
-    ok: true,
-    supervisor: actor.profile,
-    equipo: byPromotor,
-    resumen: {
-      promotores: byPromotor.length,
-      evidenciasHoy: byPromotor.reduce((acc, item) => acc + item.evidencias_hoy, 0),
-      alertas: byPromotor.reduce((acc, item) => acc + item.alertas_riesgo, 0),
-    },
-  });
+  res.json({ ok: true, supervisor: actor.profile, equipo: byPromotor, resumen: { promotores: byPromotor.length, evidenciasHoy: byPromotor.reduce((acc, item) => acc + item.evidencias_hoy, 0), alertas: byPromotor.reduce((acc, item) => acc + item.alertas_riesgo, 0) } });
 }));
 
 app.post("/miniapp/supervisor/promotor-detail", requireMiniAppActor, asyncHandler(async (req, res) => {
   const actor = req.miniappActor;
   if (actor.role !== "supervisor") return res.status(403).json({ ok: false, error: "solo_supervisor" });
-
   const { promotor_external_id } = req.body || {};
   if (!promotor_external_id) return res.status(400).json({ ok: false, error: "promotor_external_id requerido" });
-
   const promotor = await getPromotorByExternalId(promotor_external_id);
-  if (!promotor || promotor.supervisor_external_id !== actor.profile.external_id) {
-    return res.status(404).json({ ok: false, error: "promotor_no_encontrado" });
-  }
-
+  if (!promotor || promotor.supervisor_external_id !== actor.profile.external_id) return res.status(404).json({ ok: false, error: "promotor_no_encontrado" });
   const tiendaMap = await getTiendaMap();
   const visits = await getVisitasToday(promotor.promotor_id);
   const marcaMap = await getMarcaMap();
   const visitMap = await getAllVisitsMap();
   const evidencias = await getEvidenciasTodayByExternalId(promotor.external_id);
-
-  res.json({
-    ok: true,
-    promotor,
-    visitas: visits.map((visit) => ({
-      ...visit,
-      tienda_nombre: tiendaMap[visit.tienda_id]?.nombre_tienda || visit.tienda_id,
-      hora_inicio_fmt: fmtDateTimeTZ(visit.hora_inicio),
-      hora_fin_fmt: visit.hora_fin ? fmtDateTimeTZ(visit.hora_fin) : "pendiente",
-    })),
-    evidencias: evidencias.map((item) => buildEvidenceView(item, marcaMap, visitMap, tiendaMap)),
-  });
+  res.json({ ok: true, promotor, visitas: visits.map((visit) => ({ ...visit, tienda_nombre: tiendaMap[visit.tienda_id]?.nombre_tienda || visit.tienda_id, hora_inicio_fmt: fmtDateTimeTZ(visit.hora_inicio), hora_fin_fmt: visit.hora_fin ? fmtDateTimeTZ(visit.hora_fin) : "pendiente" })), evidencias: evidencias.map((item) => buildEvidenceView(item, marcaMap, visitMap, tiendaMap)) });
 }));
 
 app.post("/miniapp/supervisor/visit-expedient", requireMiniAppActor, asyncHandler(async (req, res) => {
   const actor = req.miniappActor;
   if (actor.role !== "supervisor") return res.status(403).json({ ok: false, error: "solo_supervisor" });
-
   const { visita_id } = req.body || {};
   if (!visita_id) return res.status(400).json({ ok: false, error: "visita_id requerido" });
-
   const visit = await getVisitById(visita_id);
   if (!visit) return res.status(404).json({ ok: false, error: "visita_no_encontrada" });
-
   const promotorRows = await getPromotoresDeSupervisor(actor.profile.external_id);
   const allowedIds = new Set(promotorRows.map((item) => item.promotor_id));
   if (!allowedIds.has(visit.promotor_id)) return res.status(403).json({ ok: false, error: "sin_acceso" });
-
   const tiendaMap = await getTiendaMap();
   const marcaMap = await getMarcaMap();
   const visitMap = await getAllVisitsMap();
   const evidencias = await getEvidenciasByVisitId(visita_id);
-
-  res.json({
-    ok: true,
-    visita: {
-      ...visit,
-      tienda_nombre: tiendaMap[visit.tienda_id]?.nombre_tienda || visit.tienda_id,
-      hora_inicio_fmt: fmtDateTimeTZ(visit.hora_inicio),
-      hora_fin_fmt: visit.hora_fin ? fmtDateTimeTZ(visit.hora_fin) : "pendiente",
-    },
-    evidencias: evidencias.map((item) => buildEvidenceView(item, marcaMap, visitMap, tiendaMap)),
-  });
+  res.json({ ok: true, visita: { ...visit, tienda_nombre: tiendaMap[visit.tienda_id]?.nombre_tienda || visit.tienda_id, hora_inicio_fmt: fmtDateTimeTZ(visit.hora_inicio), hora_fin_fmt: visit.hora_fin ? fmtDateTimeTZ(visit.hora_fin) : "pendiente" }, evidencias: evidencias.map((item) => buildEvidenceView(item, marcaMap, visitMap, tiendaMap)) });
 }));
 
 app.post("/miniapp/client/expedient", requireMiniAppActor, asyncHandler(async (req, res) => {
   const { visita_id } = req.body || {};
   if (!visita_id) return res.status(400).json({ ok: false, error: "visita_id requerido" });
-
   const visit = await getVisitById(visita_id);
   if (!visit) return res.status(404).json({ ok: false, error: "visita_no_encontrada" });
-
   const tiendaMap = await getTiendaMap();
   const marcaMap = await getMarcaMap();
   const visitMap = await getAllVisitsMap();
   const evidencias = await getEvidenciasByVisitId(visita_id);
-
-  res.json({
-    ok: true,
-    visita: {
-      ...visit,
-      tienda_nombre: tiendaMap[visit.tienda_id]?.nombre_tienda || visit.tienda_id,
-      cliente: tiendaMap[visit.tienda_id]?.cliente || "",
-      hora_inicio_fmt: fmtDateTimeTZ(visit.hora_inicio),
-      hora_fin_fmt: visit.hora_fin ? fmtDateTimeTZ(visit.hora_fin) : "pendiente",
-    },
-    evidencias: evidencias.map((item) => buildEvidenceView(item, marcaMap, visitMap, tiendaMap)),
-    resumen: {
-      total: evidencias.length,
-      riesgo_alto: evidencias.filter((item) => item.riesgo === "ALTO").length,
-      riesgo_medio: evidencias.filter((item) => item.riesgo === "MEDIO").length,
-      riesgo_bajo: evidencias.filter((item) => item.riesgo === "BAJO").length,
-    },
-  });
+  res.json({ ok: true, visita: { ...visit, tienda_nombre: tiendaMap[visit.tienda_id]?.nombre_tienda || visit.tienda_id, cliente: tiendaMap[visit.tienda_id]?.cliente || "", hora_inicio_fmt: fmtDateTimeTZ(visit.hora_inicio), hora_fin_fmt: visit.hora_fin ? fmtDateTimeTZ(visit.hora_fin) : "pendiente" }, evidencias: evidencias.map((item) => buildEvidenceView(item, marcaMap, visitMap, tiendaMap)), resumen: { total: evidencias.length, riesgo_alto: evidencias.filter((item) => item.riesgo === "ALTO").length, riesgo_medio: evidencias.filter((item) => item.riesgo === "MEDIO").length, riesgo_bajo: evidencias.filter((item) => item.riesgo === "BAJO").length } });
 }));
 
 app.post("/internal/client/publish-expedient", asyncHandler(async (req, res) => {
   const { chat_id, visita_id, headline = "Visita completada" } = req.body || {};
   if (!chat_id || !visita_id) return res.status(400).json({ ok: false, error: "chat_id y visita_id requeridos" });
-
   const visit = await getVisitById(visita_id);
   if (!visit) return res.status(404).json({ ok: false, error: "visita_no_encontrada" });
-
   const tiendaMap = await getTiendaMap();
   const evidencias = await getEvidenciasByVisitId(visita_id);
   const cover = evidencias.find((item) => item.url_foto) || evidencias[0];
-
-  const text =
-    `📦 *${headline}*\n\n` +
-    `🏬 *Tienda:* ${tiendaMap[visit.tienda_id]?.nombre_tienda || visit.tienda_id}\n` +
-    `📅 *Fecha:* ${visit.fecha}\n` +
-    `📸 *Evidencias:* ${evidencias.length}\n\n` +
-    "Abre el expediente completo desde la Mini App.";
-
+  const text = `📦 *${headline}*\n\n🏬 *Tienda:* ${tiendaMap[visit.tienda_id]?.nombre_tienda || visit.tienda_id}\n📅 *Fecha:* ${visit.fecha}\n📸 *Evidencias:* ${evidencias.length}\n\nAbre el expediente completo desde la Mini App.`;
   if (cover?.url_foto) {
     await sendTelegramPhoto(chat_id, cover.url_foto, text, { reply_markup: buildClienteKeyboard() });
   } else {
     await sendTelegramText(chat_id, text, { reply_markup: buildClienteKeyboard() });
   }
-
   res.json({ ok: true, sent: true, visita_id });
 }));
 
@@ -1328,10 +1090,8 @@ app.post("/telegram/webhook", asyncHandler(async (req, res) => {
     const token = req.headers["x-telegram-bot-api-secret-token"];
     if (token !== TELEGRAM_WEBHOOK_SECRET) return res.status(401).json({ ok: false, error: "invalid_secret" });
   }
-
   const incoming = parseTelegramUpdate(req.body || {});
   if (!incoming.senderHandle) return res.json({ ok: true, ignored: true });
-
   await withUserLock(incoming.senderHandle, async () => {
     try {
       const response = await routeIncoming(incoming);
@@ -1341,7 +1101,6 @@ app.post("/telegram/webhook", asyncHandler(async (req, res) => {
       if (incoming.chatId) await sendTelegramText(incoming.chatId, "Ocurrió un error procesando tu mensaje. Intenta de nuevo 🙏");
     }
   });
-
   res.json({ ok: true });
 }));
 
