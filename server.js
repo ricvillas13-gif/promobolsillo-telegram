@@ -4,15 +4,13 @@ import crypto from "crypto";
 import { google } from "googleapis";
 
 /**
- * Promobolsillo+ Telegram Backend v3.2
+ * Promobolsillo+ Telegram Backend v3
  *
- * Ajustes principales:
- * - Mantiene la estructura amplia del V3.
- * - Reamarrado a EVIDENCIAS!A:Q (17 columnas reales).
- * - Asistencia ya no intenta escribir A:V.
- * - La evidencia auxiliar de entrada/salida se intenta guardar en A:Q.
- * - Si aun así falla por permisos o nombre de hoja, NO rompe la visita.
- * - Conserva endpoints de evidencias, supervisor y cliente.
+ * Cierre largo del módulo promotor:
+ * - Asistencia con foto + GPS en entrada/salida.
+ * - Evidencias reales contra Sheets.
+ * - Endpoints para crear, listar, anular, reemplazar y anotar evidencias.
+ * - Compatibilidad con la Mini App actual y payloads más robustos.
  */
 
 const {
@@ -78,6 +76,11 @@ function safeInt(value, fallback = 0) {
   return Number.isNaN(parsed) ? fallback : parsed;
 }
 
+function safeFloat(value, fallback = 0) {
+  const parsed = parseFloat(value);
+  return Number.isNaN(parsed) ? fallback : parsed;
+}
+
 function isTrue(value) {
   const t = upper(value);
   return t === "TRUE" || t === "1" || t === "SI" || t === "SÍ";
@@ -127,6 +130,11 @@ function buildTelegramExternalId(telegramUserId) {
   return `telegram:${telegramUserId}`;
 }
 
+function nEmoji(index) {
+  const arr = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"];
+  return arr[index] || `${index + 1})`;
+}
+
 function unique(arr) {
   return Array.from(new Set((arr || []).filter(Boolean)));
 }
@@ -135,6 +143,57 @@ function pickPhotoUrl(photoLike) {
   if (!photoLike) return "";
   if (typeof photoLike === "string") return photoLike;
   return norm(photoLike.url || photoLike.dataUrl || photoLike.file_id || photoLike.fileId);
+}
+
+function pickPhotoName(photoLike, fallback = "foto.jpg") {
+  if (!photoLike || typeof photoLike === "string") return fallback;
+  return norm(photoLike.name || photoLike.file_name) || fallback;
+}
+
+function normalizeEvidenceStatus(value) {
+  const v = upper(value || "ACTIVA");
+  if (v === "ANULADA" || v === "CANCELADA") return "ANULADA";
+  return "ACTIVA";
+}
+
+const SHEETS_CELL_SOFT_LIMIT = 48000;
+
+function fitCell(value, limit = SHEETS_CELL_SOFT_LIMIT) {
+  const str = value == null ? "" : String(value);
+  return str.length > limit ? str.slice(0, limit) : str;
+}
+
+function normalizePhotoForSheet(value, fallbackTag = "[IMAGE_TOO_LARGE_FOR_SHEETS]") {
+  const str = norm(value);
+  if (!str) {
+    return { value: "", overflow: false, originalLength: 0 };
+  }
+
+  const isDataUrl = str.startsWith("data:");
+  if (!isDataUrl) {
+    return {
+      value: fitCell(str),
+      overflow: str.length > SHEETS_CELL_SOFT_LIMIT,
+      originalLength: str.length,
+    };
+  }
+
+  if (str.length <= SHEETS_CELL_SOFT_LIMIT) {
+    return { value: str, overflow: false, originalLength: str.length };
+  }
+
+  return {
+    value: fallbackTag,
+    overflow: true,
+    originalLength: str.length,
+  };
+}
+
+function mergeOverflowNote(note, info) {
+  const base = norm(note);
+  if (!info?.overflow) return fitCell(base);
+  const msg = `FOTO_EXCEDIDA_EN_SHEETS:${info.originalLength}`;
+  return fitCell(base ? `${base} | ${msg}` : msg);
 }
 
 const userLocks = new Map();
@@ -468,16 +527,16 @@ function parseEvidenceRow(row, idx) {
     producto_id: norm(row[14]),
     tipo_evidencia: norm(row[15]),
     descripcion: norm(row[16]),
-    status: "ACTIVA",
-    note: "",
-    fase: "",
-    foto_nombre: "",
-    accuracy: "",
+    status: normalizeEvidenceStatus(row[17] || "ACTIVA"),
+    note: norm(row[18]),
+    fase: norm(row[19]),
+    foto_nombre: norm(row[20]),
+    accuracy: norm(row[21]),
   };
 }
 
 async function getEvidenceById(evidencia_id) {
-  const rows = await getSheetValues("EVIDENCIAS!A2:Q");
+  const rows = await getSheetValues("EVIDENCIAS!A2:V");
   for (let i = 0; i < rows.length; i += 1) {
     if (norm(rows[i][0]) === evidencia_id) {
       return parseEvidenceRow(rows[i], i);
@@ -487,7 +546,7 @@ async function getEvidenceById(evidencia_id) {
 }
 
 async function getEvidenciasTodayByExternalId(externalId) {
-  const rows = await getSheetValues("EVIDENCIAS!A2:Q");
+  const rows = await getSheetValues("EVIDENCIAS!A2:V");
   const today = todayISO();
   return rows
     .map(parseEvidenceRow)
@@ -499,55 +558,81 @@ async function getEvidenciasTodayByExternalId(externalId) {
 }
 
 async function getEvidenciasByVisitId(visita_id) {
-  const rows = await getSheetValues("EVIDENCIAS!A2:Q");
+  const rows = await getSheetValues("EVIDENCIAS!A2:V");
   return rows
     .map(parseEvidenceRow)
     .filter((row) => row.visita_id === visita_id);
 }
 
 async function registrarEvidencia(payload) {
-  await appendSheetValues("EVIDENCIAS!A2:Q", [[
-    payload.evidencia_id,
-    payload.external_id || payload.telefono || "",
-    payload.fecha_hora || nowISO(),
-    payload.tipo_evento,
-    payload.origen,
-    payload.jornada_id || "",
-    payload.visita_id || "",
-    payload.url_foto || "",
-    payload.lat || "",
-    payload.lon || "",
-    payload.resultado_ai || "Pendiente / demo",
-    payload.score_confianza || 0.9,
-    payload.riesgo || "BAJO",
-    payload.marca_id || "",
-    payload.producto_id || "",
-    payload.tipo_evidencia || "",
-    payload.descripcion || "",
+  const photoInfo = normalizePhotoForSheet(payload.url_foto);
+  const safeNote = mergeOverflowNote(payload.note || "", photoInfo);
+
+  await appendSheetValues("EVIDENCIAS!A2:V", [[
+    fitCell(payload.evidencia_id),
+    fitCell(payload.external_id || payload.telefono || ""),
+    fitCell(payload.fecha_hora || nowISO()),
+    fitCell(payload.tipo_evento),
+    fitCell(payload.origen),
+    fitCell(payload.jornada_id || ""),
+    fitCell(payload.visita_id || ""),
+    photoInfo.value,
+    fitCell(payload.lat || ""),
+    fitCell(payload.lon || ""),
+    fitCell(payload.resultado_ai || "Pendiente / demo"),
+    fitCell(payload.score_confianza || 0.9),
+    fitCell(payload.riesgo || "BAJO"),
+    fitCell(payload.marca_id || ""),
+    fitCell(payload.producto_id || ""),
+    fitCell(payload.tipo_evidencia || ""),
+    fitCell(payload.descripcion || ""),
+    fitCell(payload.status || "ACTIVA"),
+    safeNote,
+    fitCell(payload.fase || ""),
+    fitCell(payload.foto_nombre || ""),
+    fitCell(payload.accuracy || ""),
   ]]);
+
+  return {
+    photoOverflow: photoInfo.overflow,
+    originalPhotoLength: photoInfo.originalLength,
+  };
 }
 
 async function updateEvidenceRow(evidence, patch = {}) {
+  const photoInfo = normalizePhotoForSheet(patch.url_foto ?? evidence.url_foto);
+  const noteValue = mergeOverflowNote(patch.note ?? evidence.note, photoInfo);
+
   const values = [[
-    patch.evidencia_id ?? evidence.evidencia_id,
-    patch.external_id ?? evidence.external_id,
-    patch.fecha_hora ?? evidence.fecha_hora,
-    patch.tipo_evento ?? evidence.tipo_evento,
-    patch.origen ?? evidence.origen,
-    patch.jornada_id ?? evidence.jornada_id,
-    patch.visita_id ?? evidence.visita_id,
-    patch.url_foto ?? evidence.url_foto,
-    patch.lat ?? evidence.lat,
-    patch.lon ?? evidence.lon,
-    patch.resultado_ai ?? evidence.resultado_ai,
-    patch.score_confianza ?? evidence.score_confianza,
-    patch.riesgo ?? evidence.riesgo,
-    patch.marca_id ?? evidence.marca_id,
-    patch.producto_id ?? evidence.producto_id,
-    patch.tipo_evidencia ?? evidence.tipo_evidencia,
-    patch.descripcion ?? evidence.descripcion,
+    fitCell(patch.evidencia_id ?? evidence.evidencia_id),
+    fitCell(patch.external_id ?? evidence.external_id),
+    fitCell(patch.fecha_hora ?? evidence.fecha_hora),
+    fitCell(patch.tipo_evento ?? evidence.tipo_evento),
+    fitCell(patch.origen ?? evidence.origen),
+    fitCell(patch.jornada_id ?? evidence.jornada_id),
+    fitCell(patch.visita_id ?? evidence.visita_id),
+    photoInfo.value,
+    fitCell(patch.lat ?? evidence.lat),
+    fitCell(patch.lon ?? evidence.lon),
+    fitCell(patch.resultado_ai ?? evidence.resultado_ai),
+    fitCell(patch.score_confianza ?? evidence.score_confianza),
+    fitCell(patch.riesgo ?? evidence.riesgo),
+    fitCell(patch.marca_id ?? evidence.marca_id),
+    fitCell(patch.producto_id ?? evidence.producto_id),
+    fitCell(patch.tipo_evidencia ?? evidence.tipo_evidencia),
+    fitCell(patch.descripcion ?? evidence.descripcion),
+    fitCell(patch.status ?? evidence.status),
+    noteValue,
+    fitCell(patch.fase ?? evidence.fase),
+    fitCell(patch.foto_nombre ?? evidence.foto_nombre),
+    fitCell(patch.accuracy ?? evidence.accuracy),
   ]];
-  await updateSheetValues(`EVIDENCIAS!A${evidence.rowIndex}:Q${evidence.rowIndex}`, values);
+  await updateSheetValues(`EVIDENCIAS!A${evidence.rowIndex}:V${evidence.rowIndex}`, values);
+
+  return {
+    photoOverflow: photoInfo.overflow,
+    originalPhotoLength: photoInfo.originalLength,
+  };
 }
 
 async function resolveActor(externalId) {
@@ -676,8 +761,18 @@ function buildClienteKeyboard() {
   };
 }
 
-function mainMenu() {
-  return "👋 *Promobolsillo+ Telegram*\n\nEscribe /menu para abrir opciones.";
+function mainMenu(hasPending = false) {
+  const extra = hasPending ? `\n*${nEmoji(5)}* Continuar evidencia pendiente ⏯️` : "";
+  return (
+    "👋 *Promobolsillo+ Telegram*\n\n" +
+    `*${nEmoji(0)}* Asistencia\n` +
+    `*${nEmoji(1)}* Evidencias\n` +
+    `*${nEmoji(2)}* Mis evidencias\n` +
+    `*${nEmoji(3)}* Resumen del día\n` +
+    `*${nEmoji(4)}* Ayuda\n` +
+    extra +
+    "\n\nAtajos: /menu /activas /continuar /ayuda"
+  );
 }
 
 async function handlePromotorChannel(actor, incoming, session) {
@@ -688,14 +783,69 @@ async function handlePromotorChannel(actor, incoming, session) {
     await setSession(actor.profile.external_id, STATE_MENU, data);
     return {
       type: "text",
-      text: mainMenu(),
+      text: mainMenu(Boolean(data?._pending_evid)),
       reply_markup: buildPromotorKeyboard(),
     };
   }
 
+  if (incoming.updateType === "callback_query") {
+    if (text === "promo:asis") {
+      const openVisits = await getOpenVisitsToday(actor.profile.promotor_id);
+      return {
+        type: "text",
+        text:
+          `🕒 *Asistencia*\n\n` +
+          `Visitas abiertas HOY: *${openVisits.length}*\n` +
+          "Abre la Mini App para registrar entrada/salida con foto, GPS y validación guiada.",
+        reply_markup: {
+          inline_keyboard: [[{ text: "Abrir asistencia", web_app: { url: MINIAPP_BASE_URL || "https://example.com" } }]],
+        },
+      };
+    }
+
+    if (text === "promo:evid") {
+      return {
+        type: "text",
+        text:
+          "📸 *Evidencias*\n\n" +
+          "La captura fuerte vive en la Mini App para controlar tamaño, peso y orden de envío.",
+        reply_markup: {
+          inline_keyboard: [[{ text: "Abrir captura", web_app: { url: MINIAPP_BASE_URL || "https://example.com" } }]],
+        },
+      };
+    }
+
+    if (text === "promo:my_evid") {
+      const evidencias = await getEvidenciasTodayByExternalId(actor.profile.external_id);
+      return {
+        type: "text",
+        text: `📚 *Mis evidencias de hoy*: *${evidencias.length}*\n\nAbre la Mini App para ver galería, reemplazar o anular.`,
+        reply_markup: {
+          inline_keyboard: [[{ text: "Abrir galería", web_app: { url: MINIAPP_BASE_URL || "https://example.com" } }]],
+        },
+      };
+    }
+
+    if (text === "promo:summary") {
+      const visits = await getVisitasToday(actor.profile.promotor_id);
+      const open = visits.filter((v) => !v.hora_fin).length;
+      const closed = visits.filter((v) => v.hora_fin).length;
+      const evidencias = await getEvidenciasTodayByExternalId(actor.profile.external_id);
+      return {
+        type: "text",
+        text:
+          `📊 *Resumen del día* (${todayISO()})\n\n` +
+          `🏬 Visitas: *${visits.length}*\n` +
+          `🟢 Abiertas: *${open}*\n` +
+          `✅ Cerradas: *${closed}*\n` +
+          `📸 Evidencias: *${evidencias.length}*`,
+      };
+    }
+  }
+
   return {
     type: "text",
-    text: mainMenu(),
+    text: mainMenu(Boolean(data?._pending_evid)),
     reply_markup: buildPromotorKeyboard(),
   };
 }
@@ -712,6 +862,44 @@ async function handleSupervisorChannel(actor, incoming, session) {
     };
   }
 
+  if (incoming.updateType === "callback_query") {
+    switch (text) {
+      case "sup:asis": {
+        const equipo = await getPromotoresDeSupervisor(actor.profile.external_id);
+        return {
+          type: "text",
+          text: `🧑‍🤝‍🧑 Equipo detectado: *${equipo.length}* promotor(es).\n\nAbre el panel para ver asistencias HOY y detalle por visita.`,
+          reply_markup: {
+            inline_keyboard: [[{ text: "Abrir panel supervisor", web_app: { url: MINIAPP_BASE_URL || "https://example.com" } }]],
+          },
+        };
+      }
+      case "sup:alerts":
+        return {
+          type: "text",
+          text: "🚦 Alertas del día listas para consultarse en el panel supervisor.",
+          reply_markup: {
+            inline_keyboard: [[{ text: "Abrir alertas", web_app: { url: MINIAPP_BASE_URL || "https://example.com" } }]],
+          },
+        };
+      case "sup:evid":
+        return {
+          type: "text",
+          text: "📷 Evidencias del equipo listas para revisión fotográfica dentro de la Mini App.",
+          reply_markup: {
+            inline_keyboard: [[{ text: "Abrir revisión", web_app: { url: MINIAPP_BASE_URL || "https://example.com" } }]],
+          },
+        };
+      case "sup:cart":
+        return {
+          type: "text",
+          text: "🛒 El carrito ya se puede modelar desde el panel supervisor y luego publicar al cliente Telegram.",
+        };
+      default:
+        break;
+    }
+  }
+
   return {
     type: "text",
     text: `👋 Hola, *${actor.profile.nombre}* (Supervisor).\n\nUsa el menú para continuar.`,
@@ -719,10 +907,22 @@ async function handleSupervisorChannel(actor, incoming, session) {
   };
 }
 
-async function handleClienteChannel() {
+async function handleClienteChannel(_actor, incoming) {
+  const text = norm(incoming.text).toLowerCase();
+
+  if (text === "/start" || text === "/menu" || text === "menu") {
+    return {
+      type: "text",
+      text:
+        "👋 *Canal cliente*\n\n" +
+        "Aquí recibirás visitas aprobadas, fotos clave y acceso al expediente completo dentro de Telegram.",
+      reply_markup: buildClienteKeyboard(),
+    };
+  }
+
   return {
     type: "text",
-    text: "Canal cliente",
+    text: "Escribe /menu para abrir tu panel cliente.",
     reply_markup: buildClienteKeyboard(),
   };
 }
@@ -730,6 +930,7 @@ async function handleClienteChannel() {
 async function routeIncoming(incoming) {
   const actor = await resolveActor(incoming.senderHandle);
   const session = await getSession(actor.profile.external_id);
+
   if (actor.role === "promotor") return handlePromotorChannel(actor, incoming, session);
   if (actor.role === "supervisor") return handleSupervisorChannel(actor, incoming, session);
   return handleClienteChannel(actor, incoming, session);
@@ -790,12 +991,30 @@ async function requireMiniAppActor(req, res, next) {
   try {
     const initData = req.body?.initData || req.headers["x-telegram-init-data"] || req.query?.initData;
 
+    console.log("MiniApp auth start", {
+      origin: req.headers.origin || "",
+      referer: req.headers.referer || "",
+      hasInitData: Boolean(initData),
+      initDataLength: initData ? String(initData).length : 0,
+    });
+
     const actor = await resolveActorFromInitData(initData);
 
     if (!actor) {
+      console.warn("MiniApp auth rejected", {
+        origin: req.headers.origin || "",
+        referer: req.headers.referer || "",
+        hasInitData: Boolean(initData),
+      });
       res.status(401).json({ ok: false, error: "initData inválido" });
       return;
     }
+
+    console.log("MiniApp auth ok", {
+      role: actor.role,
+      externalId: actor.externalId,
+      telegramUserId: actor.telegramUser?.id || null,
+    });
 
     req.miniappActor = actor;
     next();
@@ -823,8 +1042,15 @@ function buildEvidenceView(item, marcaMap, visitMap, tiendaMap) {
   };
 }
 
-app.post("/miniapp/bootstrap", requireMiniAppActor, asyncHandler(async (req, res) => {
+app.post("/miniapp/bootstrap", requireMiniAppActor, async (req, res) => {
   const actor = req.miniappActor;
+
+  console.log("miniapp/bootstrap ok", {
+    role: actor.role,
+    externalId: actor.externalId,
+    telegramUserId: actor.telegramUser?.id || null,
+  });
+
   res.json({
     ok: true,
     role: actor.role,
@@ -833,9 +1059,9 @@ app.post("/miniapp/bootstrap", requireMiniAppActor, asyncHandler(async (req, res
     serverTime: nowISO(),
     today: todayISO(),
   });
-}));
+});
 
-app.post("/miniapp/promotor/dashboard", requireMiniAppActor, asyncHandler(async (req, res) => {
+app.post("/miniapp/promotor/dashboard", requireMiniAppActor, async (req, res) => {
   const actor = req.miniappActor;
   if (actor.role !== "promotor") {
     res.status(403).json({ ok: false, error: "solo_promotor" });
@@ -879,7 +1105,7 @@ app.post("/miniapp/promotor/dashboard", requireMiniAppActor, asyncHandler(async 
       closedVisits: visitsToday.filter((visit) => visit.hora_fin).length,
     },
   });
-}));
+});
 
 app.post("/miniapp/promotor/start-entry", requireMiniAppActor, asyncHandler(async (req, res) => {
   const actor = req.miniappActor;
@@ -892,8 +1118,10 @@ app.post("/miniapp/promotor/start-entry", requireMiniAppActor, asyncHandler(asyn
     tienda_id,
     lat = "",
     lon = "",
+    accuracy = "",
     selfie_url = "",
     foto_data_url = "",
+    foto_nombre = "",
     notas = "",
   } = req.body || {};
 
@@ -912,106 +1140,41 @@ app.post("/miniapp/promotor/start-entry", requireMiniAppActor, asyncHandler(asyn
   const visita_id = await createVisit(actor.profile.promotor_id, tienda_id, notas);
   const photoUrl = selfie_url || foto_data_url || "";
 
-  let warning = "";
   if (photoUrl || lat || lon) {
-    try {
-      await registrarEvidencia({
-        evidencia_id: `EV-${Date.now()}-ASIS-IN`,
-        external_id: actor.profile.external_id,
-        tipo_evento: "ASISTENCIA_ENTRADA",
-        origen: "ASISTENCIA",
+    const auxResult = await registrarEvidencia({
+      evidencia_id: `EV-${Date.now()}-ASIS-OUT`,
+      external_id: actor.profile.external_id,
+      tipo_evento: "ASISTENCIA_SALIDA",
+      origen: "ASISTENCIA",
+      visita_id,
+      url_foto: photoUrl,
+      lat,
+      lon,
+      tipo_evidencia: "ASISTENCIA",
+      descripcion: "[TELEGRAM_MINIAPP_SALIDA]",
+      riesgo: "BAJO",
+      score_confianza: 0.92,
+      resultado_ai: "Salida validada (demo)",
+      status: "ACTIVA",
+      note: "",
+      fase: "NA",
+      foto_nombre,
+      accuracy,
+    });
+
+    if (auxResult.photoOverflow) {
+      console.warn("attendance evidence photo overflow (exit)", {
         visita_id,
-        url_foto: photoUrl,
-        lat,
-        lon,
-        tipo_evidencia: "ASISTENCIA",
-        descripcion: "[TELEGRAM_MINIAPP_ENTRADA]",
-        riesgo: "BAJO",
-        score_confianza: 0.93,
-        resultado_ai: "Entrada validada",
-      });
-    } catch (error) {
-      warning = "attendance_evidence_failed";
-      console.error("attendance evidence register failed (entry)", {
-        message: error?.message || String(error),
-        visita_id,
-        tienda_id,
+        originalPhotoLength: auxResult.originalPhotoLength,
       });
     }
   }
 
-  const storeMap = await getTiendaMap();
-  res.json({
-    ok: true,
-    visita_id,
-    tienda_id,
-    tienda_nombre: storeMap[tienda_id]?.nombre_tienda || tienda_id,
-    started_at: nowISO(),
-    warning,
-  });
+  const photoInfo = normalizePhotoForSheet(photoUrl);
+  res.json({ ok: true, visita_id, closed_at: nowISO(), warning: photoInfo.overflow ? "attendance_photo_too_large_for_sheets" : "" });
 }));
 
-app.post("/miniapp/promotor/close-visit", requireMiniAppActor, asyncHandler(async (req, res) => {
-  const actor = req.miniappActor;
-  if (actor.role !== "promotor") {
-    res.status(403).json({ ok: false, error: "solo_promotor" });
-    return;
-  }
-
-  const {
-    visita_id,
-    lat = "",
-    lon = "",
-    selfie_url = "",
-    foto_data_url = "",
-    notas = "",
-  } = req.body || {};
-
-  if (!visita_id) {
-    res.status(400).json({ ok: false, error: "visita_id requerido" });
-    return;
-  }
-
-  const visit = await getVisitById(visita_id);
-  if (!visit || visit.promotor_id !== actor.profile.promotor_id) {
-    res.status(404).json({ ok: false, error: "visita_no_encontrada" });
-    return;
-  }
-
-  await closeVisitById(visita_id, notas);
-  const photoUrl = selfie_url || foto_data_url || "";
-
-  let warning = "";
-  if (photoUrl || lat || lon) {
-    try {
-      await registrarEvidencia({
-        evidencia_id: `EV-${Date.now()}-ASIS-OUT`,
-        external_id: actor.profile.external_id,
-        tipo_evento: "ASISTENCIA_SALIDA",
-        origen: "ASISTENCIA",
-        visita_id,
-        url_foto: photoUrl,
-        lat,
-        lon,
-        tipo_evidencia: "ASISTENCIA",
-        descripcion: "[TELEGRAM_MINIAPP_SALIDA]",
-        riesgo: "BAJO",
-        score_confianza: 0.92,
-        resultado_ai: "Salida validada",
-      });
-    } catch (error) {
-      warning = "attendance_evidence_failed";
-      console.error("attendance evidence register failed (exit)", {
-        message: error?.message || String(error),
-        visita_id,
-      });
-    }
-  }
-
-  res.json({ ok: true, visita_id, closed_at: nowISO(), warning });
-}));
-
-app.post("/miniapp/promotor/evidence-context", requireMiniAppActor, asyncHandler(async (req, res) => {
+app.post("/miniapp/promotor/evidence-context", requireMiniAppActor, async (req, res) => {
   const actor = req.miniappActor;
   if (actor.role !== "promotor") {
     res.status(403).json({ ok: false, error: "solo_promotor" });
@@ -1040,9 +1203,9 @@ app.post("/miniapp/promotor/evidence-context", requireMiniAppActor, asyncHandler
     },
     marcas,
   });
-}));
+});
 
-app.post("/miniapp/promotor/evidence-rules", requireMiniAppActor, asyncHandler(async (req, res) => {
+app.post("/miniapp/promotor/evidence-rules", requireMiniAppActor, async (req, res) => {
   const actor = req.miniappActor;
   if (actor.role !== "promotor") {
     res.status(403).json({ ok: false, error: "solo_promotor" });
@@ -1061,7 +1224,7 @@ app.post("/miniapp/promotor/evidence-rules", requireMiniAppActor, asyncHandler(a
 
   const reglas = await getReglasPorMarca(resolvedMarcaId);
   res.json({ ok: true, reglas });
-}));
+});
 
 app.post("/miniapp/promotor/evidence-register", requireMiniAppActor, asyncHandler(async (req, res) => {
   const actor = req.miniappActor;
@@ -1075,9 +1238,11 @@ app.post("/miniapp/promotor/evidence-register", requireMiniAppActor, asyncHandle
     marca_id = "",
     marca_nombre = "",
     tipo_evidencia,
+    fase = "NA",
     descripcion = "",
     lat = "",
     lon = "",
+    accuracy = "",
     fotos = [],
     foto_data_url = "",
     foto_nombre = "",
@@ -1131,7 +1296,7 @@ app.post("/miniapp/promotor/evidence-register", requireMiniAppActor, asyncHandle
   for (let i = 0; i < finalFotos.length; i += 1) {
     const foto = finalFotos[i];
     const evidencia_id = `EV-${Date.now()}-${i + 1}`;
-    await registrarEvidencia({
+    const regResult = await registrarEvidencia({
       evidencia_id,
       external_id: actor.profile.external_id,
       tipo_evento,
@@ -1140,13 +1305,25 @@ app.post("/miniapp/promotor/evidence-register", requireMiniAppActor, asyncHandle
       url_foto: pickPhotoUrl(foto),
       lat,
       lon,
+      accuracy,
       marca_id: resolvedMarcaId,
       tipo_evidencia,
       descripcion,
       riesgo: foto.riesgo || "BAJO",
       score_confianza: foto.score_confianza || 0.9,
-      resultado_ai: foto.resultado_ai || "Evidencia coherente",
+      resultado_ai: foto.resultado_ai || "Evidencia coherente (demo)",
+      status: "ACTIVA",
+      note: "",
+      fase,
+      foto_nombre: pickPhotoName(foto, foto_nombre || `evidencia_${i + 1}.jpg`),
     });
+    if (regResult.photoOverflow) {
+      console.warn("evidence photo overflow", {
+        evidencia_id,
+        visita_id,
+        originalPhotoLength: regResult.originalPhotoLength,
+      });
+    }
     created.push(evidencia_id);
   }
 
@@ -1195,9 +1372,8 @@ app.post("/miniapp/promotor/evidence-note", requireMiniAppActor, asyncHandler(as
     return;
   }
 
-  const newDescription = note ? `${evidence.descripcion} | Nota: ${note}`.slice(0, 50000) : evidence.descripcion;
   await updateEvidenceRow(evidence, {
-    descripcion: newDescription,
+    note,
   });
 
   res.json({ ok: true, evidencia_id, note });
@@ -1222,11 +1398,9 @@ app.post("/miniapp/promotor/cancel-evidence", requireMiniAppActor, asyncHandler(
     return;
   }
 
-  const newDescription = `[ANULADA] ${evidence.descripcion || ""}${note ? ` | Motivo: ${note}` : ""}`.slice(0, 50000);
   await updateEvidenceRow(evidence, {
-    descripcion: newDescription,
-    riesgo: "BAJO",
-    resultado_ai: "ANULADA_MANUAL",
+    status: "ANULADA",
+    note: note || evidence.note,
   });
 
   res.json({ ok: true, evidencia_id, status: "ANULADA" });
@@ -1243,6 +1417,7 @@ app.post("/miniapp/promotor/replace-evidence", requireMiniAppActor, asyncHandler
     evidencia_id,
     url_foto = "",
     foto_data_url = "",
+    foto_nombre = "",
     resultado_ai = "",
     score_confianza = "",
     riesgo = "",
@@ -1268,15 +1443,17 @@ app.post("/miniapp/promotor/replace-evidence", requireMiniAppActor, asyncHandler
   await updateEvidenceRow(evidence, {
     url_foto: newPhotoUrl,
     fecha_hora: nowISO(),
+    foto_nombre: foto_nombre || evidence.foto_nombre,
     resultado_ai: resultado_ai || evidence.resultado_ai,
     score_confianza: score_confianza || evidence.score_confianza,
     riesgo: riesgo || evidence.riesgo,
+    status: "ACTIVA",
   });
 
   res.json({ ok: true, evidencia_id, replaced: true });
 }));
 
-app.post("/miniapp/supervisor/dashboard", requireMiniAppActor, asyncHandler(async (req, res) => {
+app.post("/miniapp/supervisor/dashboard", requireMiniAppActor, async (req, res) => {
   const actor = req.miniappActor;
   if (actor.role !== "supervisor") {
     res.status(403).json({ ok: false, error: "solo_supervisor" });
@@ -1311,9 +1488,9 @@ app.post("/miniapp/supervisor/dashboard", requireMiniAppActor, asyncHandler(asyn
       alertas: byPromotor.reduce((acc, item) => acc + item.alertas_riesgo, 0),
     },
   });
-}));
+});
 
-app.post("/miniapp/supervisor/promotor-detail", requireMiniAppActor, asyncHandler(async (req, res) => {
+app.post("/miniapp/supervisor/promotor-detail", requireMiniAppActor, async (req, res) => {
   const actor = req.miniappActor;
   if (actor.role !== "supervisor") {
     res.status(403).json({ ok: false, error: "solo_supervisor" });
@@ -1349,9 +1526,9 @@ app.post("/miniapp/supervisor/promotor-detail", requireMiniAppActor, asyncHandle
     })),
     evidencias: evidencias.map((item) => buildEvidenceView(item, marcaMap, visitMap, tiendaMap)),
   });
-}));
+});
 
-app.post("/miniapp/supervisor/visit-expedient", requireMiniAppActor, asyncHandler(async (req, res) => {
+app.post("/miniapp/supervisor/visit-expedient", requireMiniAppActor, async (req, res) => {
   const actor = req.miniappActor;
   if (actor.role !== "supervisor") {
     res.status(403).json({ ok: false, error: "solo_supervisor" });
@@ -1392,9 +1569,9 @@ app.post("/miniapp/supervisor/visit-expedient", requireMiniAppActor, asyncHandle
     },
     evidencias: evidencias.map((item) => buildEvidenceView(item, marcaMap, visitMap, tiendaMap)),
   });
-}));
+});
 
-app.post("/miniapp/client/expedient", requireMiniAppActor, asyncHandler(async (req, res) => {
+app.post("/miniapp/client/expedient", requireMiniAppActor, async (req, res) => {
   const { visita_id } = req.body || {};
   if (!visita_id) {
     res.status(400).json({ ok: false, error: "visita_id requerido" });
@@ -1429,42 +1606,47 @@ app.post("/miniapp/client/expedient", requireMiniAppActor, asyncHandler(async (r
       riesgo_bajo: evidencias.filter((item) => item.riesgo === "BAJO").length,
     },
   });
-}));
+});
 
-app.post("/internal/client/publish-expedient", asyncHandler(async (req, res) => {
-  const { chat_id, visita_id, headline = "Visita completada" } = req.body || {};
-  if (!chat_id || !visita_id) {
-    res.status(400).json({ ok: false, error: "chat_id y visita_id requeridos" });
-    return;
+app.post("/internal/client/publish-expedient", async (req, res) => {
+  try {
+    const { chat_id, visita_id, headline = "Visita completada" } = req.body || {};
+    if (!chat_id || !visita_id) {
+      res.status(400).json({ ok: false, error: "chat_id y visita_id requeridos" });
+      return;
+    }
+
+    const visit = await getVisitById(visita_id);
+    if (!visit) {
+      res.status(404).json({ ok: false, error: "visita_no_encontrada" });
+      return;
+    }
+
+    const tiendaMap = await getTiendaMap();
+    const evidencias = await getEvidenciasByVisitId(visita_id);
+    const cover = evidencias.find((item) => item.url_foto) || evidencias[0];
+
+    const text =
+      `📦 *${headline}*\n\n` +
+      `🏬 *Tienda:* ${tiendaMap[visit.tienda_id]?.nombre_tienda || visit.tienda_id}\n` +
+      `📅 *Fecha:* ${visit.fecha}\n` +
+      `📸 *Evidencias:* ${evidencias.length}\n\n` +
+      "Abre el expediente completo desde la Mini App.";
+
+    if (cover?.url_foto) {
+      await sendTelegramPhoto(chat_id, cover.url_foto, text, { reply_markup: buildClienteKeyboard() });
+    } else {
+      await sendTelegramText(chat_id, text, { reply_markup: buildClienteKeyboard() });
+    }
+
+    res.json({ ok: true, sent: true, visita_id });
+  } catch (error) {
+    console.error("client publish error", error);
+    res.status(500).json({ ok: false, error: error.message || "publish_failed" });
   }
+});
 
-  const visit = await getVisitById(visita_id);
-  if (!visit) {
-    res.status(404).json({ ok: false, error: "visita_no_encontrada" });
-    return;
-  }
-
-  const tiendaMap = await getTiendaMap();
-  const evidencias = await getEvidenciasByVisitId(visita_id);
-  const cover = evidencias.find((item) => item.url_foto) || evidencias[0];
-
-  const text =
-    `📦 *${headline}*\n\n` +
-    `🏬 *Tienda:* ${tiendaMap[visit.tienda_id]?.nombre_tienda || visit.tienda_id}\n` +
-    `📅 *Fecha:* ${visit.fecha}\n` +
-    `📸 *Evidencias:* ${evidencias.length}\n\n` +
-    "Abre el expediente completo desde la Mini App.";
-
-  if (cover?.url_foto) {
-    await sendTelegramPhoto(chat_id, cover.url_foto, text, { reply_markup: buildClienteKeyboard() });
-  } else {
-    await sendTelegramText(chat_id, text, { reply_markup: buildClienteKeyboard() });
-  }
-
-  res.json({ ok: true, sent: true, visita_id });
-}));
-
-app.post("/telegram/webhook", asyncHandler(async (req, res) => {
+app.post("/telegram/webhook", async (req, res) => {
   if (TELEGRAM_WEBHOOK_SECRET) {
     const token = req.headers["x-telegram-bot-api-secret-token"];
     if (token !== TELEGRAM_WEBHOOK_SECRET) {
@@ -1474,6 +1656,7 @@ app.post("/telegram/webhook", asyncHandler(async (req, res) => {
   }
 
   const incoming = parseTelegramUpdate(req.body || {});
+  console.log("Telegram senderHandle:", incoming.senderHandle, "text:", incoming.text);
   if (!incoming.senderHandle) {
     res.json({ ok: true, ignored: true });
     return;
@@ -1492,19 +1675,24 @@ app.post("/telegram/webhook", asyncHandler(async (req, res) => {
   });
 
   res.json({ ok: true });
-}));
+});
 
-app.post("/telegram/set-webhook", asyncHandler(async (req, res) => {
-  const baseUrl = buildBaseUrl(req);
-  const webhookUrl = `${baseUrl}/telegram/webhook`;
-  const payload = { url: webhookUrl };
-  if (TELEGRAM_WEBHOOK_SECRET) payload.secret_token = TELEGRAM_WEBHOOK_SECRET;
-  const result = await telegramApi("setWebhook", payload);
-  res.json({ ok: true, webhookUrl, result });
-}));
+app.post("/telegram/set-webhook", async (req, res) => {
+  try {
+    const baseUrl = buildBaseUrl(req);
+    const webhookUrl = `${baseUrl}/telegram/webhook`;
+    const payload = { url: webhookUrl };
+    if (TELEGRAM_WEBHOOK_SECRET) payload.secret_token = TELEGRAM_WEBHOOK_SECRET;
+    const result = await telegramApi("setWebhook", payload);
+    res.json({ ok: true, webhookUrl, result });
+  } catch (error) {
+    console.error("setWebhook error", error);
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
 
 app.get("/", (_req, res) => {
-  res.send("Promobolsillo+ Telegram backend v3.2 ✅");
+  res.send("Promobolsillo+ Telegram backend v3 ✅");
 });
 
 app.get("/health", (_req, res) => {
