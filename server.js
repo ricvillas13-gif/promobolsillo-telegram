@@ -9,9 +9,14 @@ const {
   SHEET_ID,
   GOOGLE_SERVICE_ACCOUNT_JSON,
   TELEGRAM_BOT_TOKEN,
+  TELEGRAM_WEBHOOK_SECRET,
   MINIAPP_BASE_URL,
   PUBLIC_BASE_URL,
 } = process.env;
+
+const TELEGRAM_API = TELEGRAM_BOT_TOKEN
+  ? `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`
+  : "";
 
 const app = express();
 app.use(bodyParser.json({ limit: "35mb" }));
@@ -151,26 +156,18 @@ function haversineDistanceMeters(lat1, lon1, lat2, lon2) {
   const dLat = toRadians(lat2 - lat1);
   const dLon = toRadians(lon2 - lon1);
   const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(toRadians(lat1)) * Math.cos(toRadians(lat2)) *
-    Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRadians(lat1)) * Math.cos(toRadians(lat2)) * Math.sin(dLon / 2) ** 2;
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   return Math.round(R * c);
 }
 
 function classifyGeofence(distanceM, radiusM, accuracyM, fallbackPolicy) {
   if (!Number.isFinite(distanceM)) {
-    return {
-      result: fallbackPolicy || "SIN_DATOS_GPS",
-      severity: "MEDIA",
-    };
+    return { result: fallbackPolicy || "SIN_DATOS_GPS", severity: "MEDIA" };
   }
-  if (distanceM <= radiusM) {
-    return { result: "OK_EN_GEOCERCA", severity: "BAJA" };
-  }
-  if (distanceM <= radiusM + (accuracyM || 0)) {
-    return { result: "OK_CON_TOLERANCIA_GPS", severity: "MEDIA" };
-  }
+  if (distanceM <= radiusM) return { result: "OK_EN_GEOCERCA", severity: "BAJA" };
+  if (distanceM <= radiusM + (accuracyM || 0)) return { result: "OK_CON_TOLERANCIA_GPS", severity: "MEDIA" };
   return { result: "FUERA_DE_GEOCERCA", severity: "ALTA" };
 }
 
@@ -181,6 +178,13 @@ function serializeGeoFallback(baseNotes, payload) {
   parts.push(`GEO_ACC:${payload.accuracy_m ?? ""}`);
   parts.push(`GEO_RAD:${payload.radio_tienda_m ?? ""}`);
   return parts.filter(Boolean).join(" | ");
+}
+
+function buildBaseUrl(req) {
+  if (PUBLIC_BASE_URL) return PUBLIC_BASE_URL.replace(/\/+$/, "");
+  const proto = String(req.headers["x-forwarded-proto"] || "https");
+  const host = String(req.headers["x-forwarded-host"] || req.headers.host || "");
+  return `${proto}://${host}`.replace(/\/+$/, "");
 }
 
 let sheetsClient = null;
@@ -283,6 +287,19 @@ async function getSupervisorByExternalId(externalId) {
   return null;
 }
 
+async function getPromotoresDeSupervisor(supervisorExternalId) {
+  const rows = await getSheetValues("PROMOTORES!A2:G");
+  return rows
+    .filter((row) => isTrue(row[5]) && norm(row[6]) === supervisorExternalId)
+    .map((row) => ({
+      external_id: norm(row[0]),
+      promotor_id: norm(row[1]),
+      nombre: norm(row[2]),
+      region: norm(row[3]),
+      cadena_principal: norm(row[4]),
+    }));
+}
+
 async function resolveActor(externalId) {
   const supervisor = await getSupervisorByExternalId(externalId);
   if (supervisor) return { role: "supervisor", profile: supervisor };
@@ -318,6 +335,10 @@ async function getTiendasAsignadas(promotorId) {
   return unique(rows.filter((row) => norm(row[0]) === promotorId && isTrue(row[3] ?? "TRUE")).map((row) => norm(row[1])));
 }
 
+async function getVisitsHeader() {
+  return getSheetHeader("VISITAS");
+}
+
 function parseVisitRow(row, idx, header) {
   const map = headerIndexMap(header);
   return {
@@ -340,10 +361,6 @@ function parseVisitRow(row, idx, header) {
     lon_tienda: norm(row[map.lon_tienda]),
     radio_tienda_m: norm(row[map.radio_tienda_m]),
   };
-}
-
-async function getVisitsHeader() {
-  return getSheetHeader("VISITAS");
 }
 
 async function getVisitasAllByPromotor(promotorId) {
@@ -444,7 +461,10 @@ async function closeVisitWithGeofence(visit, closeNotes, geofence) {
     ...visit,
     hora_fin: nowISO(),
     notas: closeNotes || visit.notas,
-    estado_visita: geofence.resultado === "FUERA_DE_GEOCERCA" || upper(visit.resultado_geocerca_entrada) === "FUERA_DE_GEOCERCA" ? "CERRADA_CON_ALERTA" : "CERRADA",
+    estado_visita:
+      geofence.resultado === "FUERA_DE_GEOCERCA" || upper(visit.resultado_geocerca_entrada) === "FUERA_DE_GEOCERCA"
+        ? "CERRADA_CON_ALERTA"
+        : "CERRADA",
     resultado_geocerca_salida: geofence.resultado,
     distancia_salida_m: geofence.distancia_m,
     accuracy_salida_m: geofence.accuracy_m,
@@ -535,7 +555,14 @@ async function getEvidenceById(evidenciaId) {
 async function getEvidenciasTodayByExternalId(externalId) {
   const rows = await getSheetValues("EVIDENCIAS!A2:V");
   const today = todayISO();
-  return rows.map(parseEvidenceRow).filter((row) => row.external_id === externalId && row.fecha_hora && ymdInTZ(new Date(row.fecha_hora), APP_TZ) === today);
+  return rows
+    .map(parseEvidenceRow)
+    .filter((row) => row.external_id === externalId && row.fecha_hora && ymdInTZ(new Date(row.fecha_hora), APP_TZ) === today);
+}
+
+async function getEvidenciasByVisitId(visitaId) {
+  const rows = await getSheetValues("EVIDENCIAS!A2:V");
+  return rows.map(parseEvidenceRow).filter((row) => row.visita_id === visitaId);
 }
 
 async function registrarEvidencia(payload) {
@@ -662,6 +689,302 @@ function buildEvidenceView(item, marcaMap, visitMap, tiendaMap) {
   };
 }
 
+const STATE_MENU = "MENU";
+const STATE_SUP_MENU = "SUP_MENU";
+const STATE_CLIENT_MENU = "CLIENT_MENU";
+
+async function findSessionRow(externalId) {
+  const rows = await getSheetValues("SESIONES!A2:C");
+  for (let i = 0; i < rows.length; i += 1) {
+    if (norm(rows[i][0]) === externalId) {
+      let data_json = {};
+      try {
+        data_json = rows[i][2] ? JSON.parse(rows[i][2]) : {};
+      } catch {
+        data_json = {};
+      }
+      return {
+        rowIndex: i + 2,
+        estado_actual: norm(rows[i][1]) || STATE_MENU,
+        data_json,
+      };
+    }
+  }
+  return null;
+}
+
+async function getSession(externalId) {
+  const found = await findSessionRow(externalId);
+  if (found) return found;
+  await appendSheetValues("SESIONES!A2:C", [[externalId, STATE_MENU, "{}"]]);
+  return findSessionRow(externalId);
+}
+
+async function setSession(externalId, estado_actual, data_json = {}) {
+  const found = await findSessionRow(externalId);
+  const body = JSON.stringify(data_json || {});
+  if (!found) {
+    await appendSheetValues("SESIONES!A2:C", [[externalId, estado_actual, body]]);
+    return;
+  }
+  await updateSheetValues(`SESIONES!A${found.rowIndex}:C${found.rowIndex}`, [[externalId, estado_actual, body]]);
+}
+
+function parseTelegramUpdate(update) {
+  const message = update.message || update.edited_message || null;
+  const callback = update.callback_query || null;
+
+  if (callback) {
+    const chatId = callback.message?.chat?.id;
+    const senderId = callback.from?.id;
+    return {
+      updateType: "callback_query",
+      updateId: update.update_id,
+      chatId,
+      senderId,
+      senderHandle: buildTelegramExternalId(senderId),
+      text: norm(callback.data),
+      callbackQueryId: callback.id,
+      raw: update,
+    };
+  }
+
+  if (!message) {
+    return {
+      updateType: "unsupported",
+      updateId: update.update_id,
+      chatId: null,
+      senderId: null,
+      senderHandle: "",
+      text: "",
+      raw: update,
+    };
+  }
+
+  const senderId = message.from?.id;
+  return {
+    updateType: "message",
+    updateId: update.update_id,
+    chatId: message.chat?.id,
+    senderId,
+    senderHandle: buildTelegramExternalId(senderId),
+    text: norm(message.text || message.caption || message.web_app_data?.data || ""),
+    raw: update,
+  };
+}
+
+async function telegramApi(method, payload) {
+  if (!TELEGRAM_API) throw new Error("TELEGRAM_BOT_TOKEN no configurado");
+  const res = await fetch(`${TELEGRAM_API}/${method}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Telegram API ${method} failed: ${res.status} ${text}`);
+  }
+  return res.json();
+}
+
+async function sendTelegramText(chatId, text, options = {}) {
+  return telegramApi("sendMessage", {
+    chat_id: chatId,
+    text,
+    parse_mode: "Markdown",
+    disable_web_page_preview: true,
+    reply_markup: options.reply_markup,
+  });
+}
+
+async function sendTelegramPhoto(chatId, fileIdOrUrl, caption = "", options = {}) {
+  return telegramApi("sendPhoto", {
+    chat_id: chatId,
+    photo: fileIdOrUrl,
+    caption,
+    parse_mode: "Markdown",
+    reply_markup: options.reply_markup,
+  });
+}
+
+async function answerCallbackQuery(callbackQueryId, text = "") {
+  return telegramApi("answerCallbackQuery", { callback_query_id: callbackQueryId, text });
+}
+
+function buildPromotorKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: "Asistencia", callback_data: "PROMO:ASIS" }, { text: "Evidencias", callback_data: "PROMO:EVID" }],
+      [{ text: "Mis evidencias", callback_data: "PROMO:MY_EVID" }, { text: "Resumen", callback_data: "PROMO:SUMMARY" }],
+      [{ text: "Abrir Mini App", web_app: { url: MINIAPP_BASE_URL || "https://example.com" } }],
+    ],
+  };
+}
+
+function buildSupervisorKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: "Asistencias HOY", callback_data: "SUP:ASIS" }, { text: "Alertas", callback_data: "SUP:ALERTS" }],
+      [{ text: "Evidencias", callback_data: "SUP:EVID" }, { text: "Resumen", callback_data: "SUP:SUMMARY" }],
+      [{ text: "Abrir panel", web_app: { url: MINIAPP_BASE_URL || "https://example.com" } }],
+    ],
+  };
+}
+
+function buildClienteKeyboard() {
+  return {
+    inline_keyboard: [[{ text: "Abrir expediente", web_app: { url: MINIAPP_BASE_URL || "https://example.com" } }]],
+  };
+}
+
+function promotorMenuText() {
+  return [
+    "👋 *Promobolsillo+ Telegram*",
+    "",
+    "1️⃣ Asistencia",
+    "2️⃣ Evidencias",
+    "3️⃣ Mis evidencias",
+    "4️⃣ Resumen del día",
+    "",
+    "Escribe /menu cuando quieras volver aquí.",
+  ].join("\n");
+}
+
+async function handlePromotorChannel(actor, incoming, session) {
+  const text = norm(incoming.text).toLowerCase();
+  if (text === "/start" || text === "/menu" || text === "menu") {
+    await setSession(actor.profile.external_id, STATE_MENU, session.data_json || {});
+    return { type: "text", text: promotorMenuText(), reply_markup: buildPromotorKeyboard() };
+  }
+
+  if (incoming.updateType === "callback_query") {
+    if (text === "promo:asis") {
+      const visits = await getVisitasToday(actor.profile.promotor_id);
+      const open = visits.filter((v) => !v.hora_fin).length;
+      return {
+        type: "text",
+        text: `🕒 *Asistencia*\n\nVisitas hoy: *${visits.length}*\nAbiertas: *${open}*\n\nAbre la Mini App para registrar entrada/salida con geocerca, selfie y ubicación.`,
+        reply_markup: { inline_keyboard: [[{ text: "Abrir asistencia", web_app: { url: MINIAPP_BASE_URL || "https://example.com" } }]] },
+      };
+    }
+    if (text === "promo:evid") {
+      return {
+        type: "text",
+        text: "📸 *Evidencias*\n\nCaptura fotos estructuradas por marca, tipo y fase desde la Mini App.",
+        reply_markup: { inline_keyboard: [[{ text: "Abrir evidencias", web_app: { url: MINIAPP_BASE_URL || "https://example.com" } }]] },
+      };
+    }
+    if (text === "promo:my_evid") {
+      const evidencias = await getEvidenciasTodayByExternalId(actor.profile.external_id);
+      return {
+        type: "text",
+        text: `📚 *Mis evidencias de hoy*: *${evidencias.length}*\n\nRevisa filtros, notas y reemplazos dentro de la Mini App.`,
+        reply_markup: { inline_keyboard: [[{ text: "Abrir galería", web_app: { url: MINIAPP_BASE_URL || "https://example.com" } }]] },
+      };
+    }
+    if (text === "promo:summary") {
+      const visits = await getVisitasToday(actor.profile.promotor_id);
+      const evidencias = await getEvidenciasTodayByExternalId(actor.profile.external_id);
+      const outside = visits.filter((v) => upper(v.resultado_geocerca_entrada) === "FUERA_DE_GEOCERCA" || upper(v.resultado_geocerca_salida) === "FUERA_DE_GEOCERCA").length;
+      return {
+        type: "text",
+        text: `📊 *Resumen del día* (${todayISO()})\n\n🏬 Visitas: *${visits.length}*\n📸 Evidencias: *${evidencias.length}*\n🚨 Con alerta geocerca: *${outside}*`,
+      };
+    }
+  }
+
+  return { type: "text", text: promotorMenuText(), reply_markup: buildPromotorKeyboard() };
+}
+
+async function handleSupervisorChannel(actor, incoming, session) {
+  const text = norm(incoming.text).toLowerCase();
+  if (text === "/start" || text === "/menu" || text === "/sup" || text === "sup") {
+    await setSession(actor.profile.external_id, STATE_SUP_MENU, session.data_json || {});
+    return { type: "text", text: `👋 Hola, *${actor.profile.nombre}* (Supervisor).\n\nTu panel está disponible en Telegram.`, reply_markup: buildSupervisorKeyboard() };
+  }
+
+  if (incoming.updateType === "callback_query") {
+    if (text === "sup:asis") {
+      const team = await getPromotoresDeSupervisor(actor.profile.external_id);
+      let totalVisits = 0;
+      let openVisits = 0;
+      for (const prom of team) {
+        const visits = await getVisitasToday(prom.promotor_id);
+        totalVisits += visits.length;
+        openVisits += visits.filter((v) => !v.hora_fin).length;
+      }
+      return { type: "text", text: `🕒 *Asistencias HOY*\n\nPromotores: *${team.length}*\nVisitas: *${totalVisits}*\nAbiertas: *${openVisits}*`, reply_markup: buildSupervisorKeyboard() };
+    }
+    if (text === "sup:alerts") {
+      const rows = await getSheetValues("ALERTAS!A2:H");
+      const openAlerts = rows.filter((row) => upper(row[7] || "ABIERTA") === "ABIERTA").length;
+      return { type: "text", text: `🚨 *Alertas abiertas*: *${openAlerts}*\n\nAbre el panel para revisar detalles.`, reply_markup: buildSupervisorKeyboard() };
+    }
+    if (text === "sup:evid") {
+      return { type: "text", text: "📸 *Evidencias*\n\nLa revisión visual y el filtrado se realizan desde la Mini App.", reply_markup: buildSupervisorKeyboard() };
+    }
+    if (text === "sup:summary") {
+      const rows = await getSheetValues("ALERTAS!A2:H");
+      const today = todayISO();
+      const todayAlerts = rows.filter((row) => row[1] && ymdInTZ(new Date(row[1]), APP_TZ) === today).length;
+      return { type: "text", text: `📊 *Resumen Supervisor*\n\nAlertas hoy: *${todayAlerts}*`, reply_markup: buildSupervisorKeyboard() };
+    }
+  }
+
+  return { type: "text", text: `👋 Hola, *${actor.profile.nombre}* (Supervisor).\n\nUsa el menú para continuar.`, reply_markup: buildSupervisorKeyboard() };
+}
+
+async function handleClienteChannel(_actor, incoming, session) {
+  const text = norm(incoming.text).toLowerCase();
+  if (text === "/start" || text === "/menu" || text === "menu") {
+    await setSession(session?.external_id || "cliente", STATE_CLIENT_MENU, {});
+    return {
+      type: "text",
+      text: "👋 *Canal cliente*\n\nAquí recibirás acceso al expediente y evidencia publicada.",
+      reply_markup: buildClienteKeyboard(),
+    };
+  }
+  return { type: "text", text: "Escribe /menu para abrir tu panel cliente.", reply_markup: buildClienteKeyboard() };
+}
+
+async function routeIncoming(incoming) {
+  const actor = await resolveActor(incoming.senderHandle);
+  const session = await getSession(actor.profile.external_id);
+  if (actor.role === "promotor") return handlePromotorChannel(actor, incoming, session);
+  if (actor.role === "supervisor") return handleSupervisorChannel(actor, incoming, session);
+  return handleClienteChannel(actor, incoming, session);
+}
+
+async function respondToTelegram(incoming, response) {
+  if (!response || !incoming.chatId) return;
+  if (incoming.callbackQueryId) await answerCallbackQuery(incoming.callbackQueryId, "OK");
+  if (response.type === "photo") {
+    await sendTelegramPhoto(incoming.chatId, response.photo, response.caption || "", { reply_markup: response.reply_markup });
+    return;
+  }
+  await sendTelegramText(incoming.chatId, response.text || "OK", { reply_markup: response.reply_markup });
+}
+
+const userLocks = new Map();
+
+async function withUserLock(key, fn) {
+  const previous = userLocks.get(key) || Promise.resolve();
+  let release;
+  const current = new Promise((resolve) => {
+    release = resolve;
+  });
+  userLocks.set(key, previous.then(() => current).catch(() => current));
+  await previous;
+  try {
+    return await fn();
+  } finally {
+    release();
+    setTimeout(() => {
+      if (userLocks.get(key) === current) userLocks.delete(key);
+    }, 5000);
+  }
+}
+
 function verifyTelegramWebAppInitData(initData) {
   if (!initData || !TELEGRAM_BOT_TOKEN) return false;
   const params = new URLSearchParams(initData);
@@ -768,6 +1091,7 @@ app.post("/miniapp/promotor/dashboard", requireMiniAppActor, asyncHandler(async 
   }));
   const visitsToday = await getVisitasToday(actor.profile.promotor_id);
   const openVisits = visitsToday.filter((visit) => !visit.hora_fin);
+  const evidencias = await getEvidenciasTodayByExternalId(actor.profile.external_id);
   res.json({
     ok: true,
     promotor: actor.profile,
@@ -778,6 +1102,7 @@ app.post("/miniapp/promotor/dashboard", requireMiniAppActor, asyncHandler(async 
       assignedStores: stores.length,
       openVisits: openVisits.length,
       closedVisits: visitsToday.filter((visit) => visit.hora_fin).length,
+      evidenciasHoy: evidencias.length,
     },
   });
 }));
@@ -1047,8 +1372,78 @@ app.post("/miniapp/promotor/replace-evidence", requireMiniAppActor, asyncHandler
   res.json({ ok: true, evidencia_id, replaced: true, warning: result.photoOverflow ? "evidence_photo_too_large_for_sheets" : "" });
 }));
 
+app.post("/miniapp/supervisor/dashboard", requireMiniAppActor, asyncHandler(async (req, res) => {
+  const actor = req.miniappActor;
+  if (actor.role !== "supervisor") return res.status(403).json({ ok: false, error: "solo_supervisor" });
+  const team = await getPromotoresDeSupervisor(actor.profile.external_id);
+  const summary = { promotores: team.length, visitasHoy: 0, abiertas: 0, evidenciasHoy: 0, alertas: 0 };
+  for (const promotor of team) {
+    const visits = await getVisitasToday(promotor.promotor_id);
+    const evidencias = await getEvidenciasTodayByExternalId(promotor.external_id);
+    summary.visitasHoy += visits.length;
+    summary.abiertas += visits.filter((v) => !v.hora_fin).length;
+    summary.evidenciasHoy += evidencias.length;
+  }
+  const alertRows = await getSheetValues("ALERTAS!A2:H");
+  summary.alertas = alertRows.filter((row) => upper(row[7] || "ABIERTA") === "ABIERTA").length;
+  res.json({ ok: true, supervisor: actor.profile, summary });
+}));
+
+app.post("/miniapp/supervisor/visit-expedient", requireMiniAppActor, asyncHandler(async (req, res) => {
+  const actor = req.miniappActor;
+  if (actor.role !== "supervisor") return res.status(403).json({ ok: false, error: "solo_supervisor" });
+  const { visita_id } = req.body || {};
+  if (!visita_id) return res.status(400).json({ ok: false, error: "visita_id requerido" });
+  const visit = await getVisitById(visita_id);
+  if (!visit) return res.status(404).json({ ok: false, error: "visita_no_encontrada" });
+  const team = await getPromotoresDeSupervisor(actor.profile.external_id);
+  const allowed = new Set(team.map((item) => item.promotor_id));
+  if (!allowed.has(visit.promotor_id)) return res.status(403).json({ ok: false, error: "sin_acceso" });
+  const tiendaMap = await getTiendaMap();
+  const marcaMap = await getMarcaMap();
+  const visitMap = await getAllVisitsMap();
+  const evidencias = await getEvidenciasByVisitId(visita_id);
+  res.json({
+    ok: true,
+    visita: { ...visit, tienda_nombre: tiendaMap[visit.tienda_id]?.nombre_tienda || visit.tienda_id },
+    evidencias: evidencias.map((item) => buildEvidenceView(item, marcaMap, visitMap, tiendaMap)),
+  });
+}));
+
+app.post("/telegram/webhook", asyncHandler(async (req, res) => {
+  if (TELEGRAM_WEBHOOK_SECRET) {
+    const token = req.headers["x-telegram-bot-api-secret-token"];
+    if (token !== TELEGRAM_WEBHOOK_SECRET) return res.status(401).json({ ok: false, error: "invalid_secret" });
+  }
+
+  const incoming = parseTelegramUpdate(req.body || {});
+  if (!incoming.senderHandle) return res.json({ ok: true, ignored: true });
+
+  await withUserLock(incoming.senderHandle, async () => {
+    try {
+      const response = await routeIncoming(incoming);
+      await respondToTelegram(incoming, response);
+    } catch (error) {
+      console.error("telegram webhook error", error);
+      if (incoming.chatId) {
+        await sendTelegramText(incoming.chatId, "Ocurrió un error procesando tu mensaje. Intenta de nuevo 🙏");
+      }
+    }
+  });
+
+  res.json({ ok: true });
+}));
+
+app.post("/telegram/set-webhook", asyncHandler(async (req, res) => {
+  const webhookUrl = `${buildBaseUrl(req)}/telegram/webhook`;
+  const payload = { url: webhookUrl };
+  if (TELEGRAM_WEBHOOK_SECRET) payload.secret_token = TELEGRAM_WEBHOOK_SECRET;
+  const result = await telegramApi("setWebhook", payload);
+  res.json({ ok: true, webhookUrl, result });
+}));
+
 app.get("/", (_req, res) => {
-  res.send("Promobolsillo+ Telegram backend v3.6 geocerca ✅");
+  res.send("Promobolsillo+ Telegram backend v3.7 full geocerca ✅");
 });
 
 app.get("/health", (_req, res) => {
