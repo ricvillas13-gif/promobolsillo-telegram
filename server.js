@@ -654,16 +654,58 @@ async function resolveMarcaIdByName(marcaNombre) {
   return "";
 }
 
+async function getTiposEvidenciaCatalog() {
+  try {
+    const rows = await getSheetValues("TIPOS_EVIDENCIA!A2:C");
+    return rows
+      .filter((row) => norm(row[0]))
+      .map((row) => ({
+        tipo_evidencia: norm(row[0]),
+        descripcion_corta: norm(row[1]),
+        fotos_requeridas: safeInt(row[2], 1),
+      }));
+  } catch {
+    return [];
+  }
+}
+
 async function getReglasPorMarca(marcaId) {
   const rows = await getSheetValues("REGLAS_EVIDENCIA!A2:E");
-  return rows
+  const rules = rows
     .filter((row) => norm(row[0]) === marcaId && isTrue(row[4] ?? "TRUE"))
     .map((row) => ({
       marca_id: marcaId,
       tipo_evidencia: norm(row[1]),
       fotos_requeridas: safeInt(row[2], 1),
       requiere_antes_despues: isTrue(row[3]),
+      origen: "REGLAS_EVIDENCIA",
     }));
+
+  const catalog = await getTiposEvidenciaCatalog();
+  if (!catalog.length) return rules;
+
+  const merged = [];
+  const byType = new Map();
+
+  for (const rule of rules) {
+    byType.set(upper(rule.tipo_evidencia), rule);
+    merged.push(rule);
+  }
+
+  for (const item of catalog) {
+    const key = upper(item.tipo_evidencia);
+    if (byType.has(key)) continue;
+    merged.push({
+      marca_id: marcaId,
+      tipo_evidencia: item.tipo_evidencia,
+      fotos_requeridas: item.fotos_requeridas || 1,
+      requiere_antes_despues: false,
+      descripcion_corta: item.descripcion_corta,
+      origen: "TIPOS_EVIDENCIA",
+    });
+  }
+
+  return merged;
 }
 
 async function getAllVisitsMap() {
