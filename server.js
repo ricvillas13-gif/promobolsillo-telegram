@@ -3,16 +3,6 @@ import bodyParser from "body-parser";
 import crypto from "crypto";
 import { google } from "googleapis";
 
-/**
- * Promobolsillo+ Telegram Backend v3
- *
- * Cierre largo del módulo promotor:
- * - Asistencia con foto + GPS en entrada/salida.
- * - Evidencias reales contra Sheets.
- * - Endpoints para crear, listar, anular, reemplazar y anotar evidencias.
- * - Compatibilidad con la Mini App actual y payloads más robustos.
- */
-
 const {
   PORT = 10000,
   APP_TZ = "America/Mexico_City",
@@ -23,13 +13,6 @@ const {
   PUBLIC_BASE_URL,
   MINIAPP_BASE_URL,
 } = process.env;
-
-if (!SHEET_ID || !GOOGLE_SERVICE_ACCOUNT_JSON) {
-  console.warn("⚠️ Falta SHEET_ID o GOOGLE_SERVICE_ACCOUNT_JSON.");
-}
-if (!TELEGRAM_BOT_TOKEN) {
-  console.warn("⚠️ Falta TELEGRAM_BOT_TOKEN.");
-}
 
 const TELEGRAM_API = TELEGRAM_BOT_TOKEN
   ? `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`
@@ -47,19 +30,13 @@ const ALLOWED_ORIGINS = [
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-
   if (origin && ALLOWED_ORIGINS.includes(origin)) {
     res.header("Access-Control-Allow-Origin", origin);
   }
-
   res.header("Vary", "Origin");
   res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, x-telegram-init-data");
   res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(204);
-  }
-
+  if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 
@@ -73,11 +50,6 @@ function upper(value) {
 
 function safeInt(value, fallback = 0) {
   const parsed = parseInt(value, 10);
-  return Number.isNaN(parsed) ? fallback : parsed;
-}
-
-function safeFloat(value, fallback = 0) {
-  const parsed = parseFloat(value);
   return Number.isNaN(parsed) ? fallback : parsed;
 }
 
@@ -130,11 +102,6 @@ function buildTelegramExternalId(telegramUserId) {
   return `telegram:${telegramUserId}`;
 }
 
-function nEmoji(index) {
-  const arr = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"];
-  return arr[index] || `${index + 1})`;
-}
-
 function unique(arr) {
   return Array.from(new Set((arr || []).filter(Boolean)));
 }
@@ -145,15 +112,10 @@ function pickPhotoUrl(photoLike) {
   return norm(photoLike.url || photoLike.dataUrl || photoLike.file_id || photoLike.fileId);
 }
 
-function pickPhotoName(photoLike, fallback = "foto.jpg") {
-  if (!photoLike || typeof photoLike === "string") return fallback;
-  return norm(photoLike.name || photoLike.file_name) || fallback;
-}
-
-function normalizeEvidenceStatus(value) {
-  const v = upper(value || "ACTIVA");
-  if (v === "ANULADA" || v === "CANCELADA") return "ANULADA";
-  return "ACTIVA";
+function pickPhotoName(photoLike, fallback = "") {
+  if (!photoLike) return fallback;
+  if (typeof photoLike === "string") return fallback;
+  return norm(photoLike.name || photoLike.fileName || fallback);
 }
 
 const SHEETS_CELL_SOFT_LIMIT = 48000;
@@ -369,11 +331,7 @@ async function getTiendaMap() {
 
 async function getTiendasAsignadas(promotor_id) {
   const rows = await getSheetValues("ASIGNACIONES!A2:D");
-  return unique(
-    rows
-      .filter((row) => norm(row[0]) === promotor_id && isTrue(row[3] ?? "TRUE"))
-      .map((row) => norm(row[1]))
-  );
+  return unique(rows.filter((row) => norm(row[0]) === promotor_id && isTrue(row[3] ?? "TRUE")).map((row) => norm(row[1])));
 }
 
 async function getVisitasAllByPromotor(promotor_id) {
@@ -462,10 +420,7 @@ async function getMarcasActivas() {
     const marca_id = norm(row[0]);
     if (!marca_id) continue;
     if (!isTrue(row[3] ?? "TRUE")) continue;
-    out.push({
-      marca_id,
-      marca_nombre: norm(row[2]),
-    });
+    out.push({ marca_id, marca_nombre: norm(row[2]) });
   }
   return out.sort((a, b) => a.marca_nombre.localeCompare(b.marca_nombre));
 }
@@ -508,6 +463,7 @@ async function getReglasPorMarca(marca_id) {
 }
 
 function parseEvidenceRow(row, idx) {
+  const descripcion = norm(row[16]);
   return {
     rowIndex: idx + 2,
     evidencia_id: norm(row[0]),
@@ -526,8 +482,8 @@ function parseEvidenceRow(row, idx) {
     marca_id: norm(row[13]),
     producto_id: norm(row[14]),
     tipo_evidencia: norm(row[15]),
-    descripcion: norm(row[16]),
-    status: normalizeEvidenceStatus(row[17] || "ACTIVA"),
+    descripcion,
+    status: norm(row[17]) || (descripcion.startsWith("[ANULADA]") ? "ANULADA" : "ACTIVA"),
     note: norm(row[18]),
     fase: norm(row[19]),
     foto_nombre: norm(row[20]),
@@ -538,9 +494,7 @@ function parseEvidenceRow(row, idx) {
 async function getEvidenceById(evidencia_id) {
   const rows = await getSheetValues("EVIDENCIAS!A2:V");
   for (let i = 0; i < rows.length; i += 1) {
-    if (norm(rows[i][0]) === evidencia_id) {
-      return parseEvidenceRow(rows[i], i);
-    }
+    if (norm(rows[i][0]) === evidencia_id) return parseEvidenceRow(rows[i], i);
   }
   return null;
 }
@@ -550,18 +504,12 @@ async function getEvidenciasTodayByExternalId(externalId) {
   const today = todayISO();
   return rows
     .map(parseEvidenceRow)
-    .filter((row) => {
-      if (row.external_id !== externalId) return false;
-      if (!row.fecha_hora) return false;
-      return ymdInTZ(new Date(row.fecha_hora), APP_TZ) === today;
-    });
+    .filter((row) => row.external_id === externalId && row.fecha_hora && ymdInTZ(new Date(row.fecha_hora), APP_TZ) === today);
 }
 
 async function getEvidenciasByVisitId(visita_id) {
   const rows = await getSheetValues("EVIDENCIAS!A2:V");
-  return rows
-    .map(parseEvidenceRow)
-    .filter((row) => row.visita_id === visita_id);
+  return rows.map(parseEvidenceRow).filter((row) => row.visita_id === visita_id);
 }
 
 async function registrarEvidencia(payload) {
@@ -627,6 +575,7 @@ async function updateEvidenceRow(evidence, patch = {}) {
     fitCell(patch.foto_nombre ?? evidence.foto_nombre),
     fitCell(patch.accuracy ?? evidence.accuracy),
   ]];
+
   await updateSheetValues(`EVIDENCIAS!A${evidence.rowIndex}:V${evidence.rowIndex}`, values);
 
   return {
@@ -638,17 +587,9 @@ async function updateEvidenceRow(evidence, patch = {}) {
 async function resolveActor(externalId) {
   const supervisor = await getSupervisorByExternalId(externalId);
   if (supervisor) return { role: "supervisor", profile: supervisor };
-
   const promotor = await getPromotorByExternalId(externalId);
   if (promotor) return { role: "promotor", profile: promotor };
-
-  return {
-    role: "cliente",
-    profile: {
-      external_id: externalId,
-      nombre: "Cliente",
-    },
-  };
+  return { role: "cliente", profile: { external_id: externalId, nombre: "Cliente" } };
 }
 
 function parseTelegramUpdate(update) {
@@ -729,10 +670,7 @@ async function sendTelegramPhoto(chatId, fileIdOrUrl, caption = "", options = {}
 }
 
 async function answerCallbackQuery(callbackQueryId, text = "") {
-  return telegramApi("answerCallbackQuery", {
-    callback_query_id: callbackQueryId,
-    text,
-  });
+  return telegramApi("answerCallbackQuery", { callback_query_id: callbackQueryId, text });
 }
 
 function buildPromotorKeyboard() {
@@ -761,17 +699,15 @@ function buildClienteKeyboard() {
   };
 }
 
-function mainMenu(hasPending = false) {
-  const extra = hasPending ? `\n*${nEmoji(5)}* Continuar evidencia pendiente ⏯️` : "";
+function mainMenu() {
   return (
     "👋 *Promobolsillo+ Telegram*\n\n" +
-    `*${nEmoji(0)}* Asistencia\n` +
-    `*${nEmoji(1)}* Evidencias\n` +
-    `*${nEmoji(2)}* Mis evidencias\n` +
-    `*${nEmoji(3)}* Resumen del día\n` +
-    `*${nEmoji(4)}* Ayuda\n` +
-    extra +
-    "\n\nAtajos: /menu /activas /continuar /ayuda"
+    "1️⃣ Asistencia\n" +
+    "2️⃣ Evidencias\n" +
+    "3️⃣ Mis evidencias\n" +
+    "4️⃣ Resumen del día\n" +
+    "5️⃣ Ayuda\n\n" +
+    "Atajos: /menu /activas /ayuda"
   );
 }
 
@@ -781,11 +717,7 @@ async function handlePromotorChannel(actor, incoming, session) {
 
   if (text === "/start" || text === "/menu" || text === "menu") {
     await setSession(actor.profile.external_id, STATE_MENU, data);
-    return {
-      type: "text",
-      text: mainMenu(Boolean(data?._pending_evid)),
-      reply_markup: buildPromotorKeyboard(),
-    };
+    return { type: "text", text: mainMenu(), reply_markup: buildPromotorKeyboard() };
   }
 
   if (incoming.updateType === "callback_query") {
@@ -793,39 +725,25 @@ async function handlePromotorChannel(actor, incoming, session) {
       const openVisits = await getOpenVisitsToday(actor.profile.promotor_id);
       return {
         type: "text",
-        text:
-          `🕒 *Asistencia*\n\n` +
-          `Visitas abiertas HOY: *${openVisits.length}*\n` +
-          "Abre la Mini App para registrar entrada/salida con foto, GPS y validación guiada.",
-        reply_markup: {
-          inline_keyboard: [[{ text: "Abrir asistencia", web_app: { url: MINIAPP_BASE_URL || "https://example.com" } }]],
-        },
+        text: `🕒 *Asistencia*\n\nVisitas abiertas HOY: *${openVisits.length}*\nAbre la Mini App para registrar entrada/salida con foto, GPS y validación guiada.`,
+        reply_markup: { inline_keyboard: [[{ text: "Abrir asistencia", web_app: { url: MINIAPP_BASE_URL || "https://example.com" } }]] },
       };
     }
-
     if (text === "promo:evid") {
       return {
         type: "text",
-        text:
-          "📸 *Evidencias*\n\n" +
-          "La captura fuerte vive en la Mini App para controlar tamaño, peso y orden de envío.",
-        reply_markup: {
-          inline_keyboard: [[{ text: "Abrir captura", web_app: { url: MINIAPP_BASE_URL || "https://example.com" } }]],
-        },
+        text: "📸 *Evidencias*\n\nLa captura fuerte vive en la Mini App para controlar tamaño, peso y orden de envío.",
+        reply_markup: { inline_keyboard: [[{ text: "Abrir captura", web_app: { url: MINIAPP_BASE_URL || "https://example.com" } }]] },
       };
     }
-
     if (text === "promo:my_evid") {
       const evidencias = await getEvidenciasTodayByExternalId(actor.profile.external_id);
       return {
         type: "text",
         text: `📚 *Mis evidencias de hoy*: *${evidencias.length}*\n\nAbre la Mini App para ver galería, reemplazar o anular.`,
-        reply_markup: {
-          inline_keyboard: [[{ text: "Abrir galería", web_app: { url: MINIAPP_BASE_URL || "https://example.com" } }]],
-        },
+        reply_markup: { inline_keyboard: [[{ text: "Abrir galería", web_app: { url: MINIAPP_BASE_URL || "https://example.com" } }]] },
       };
     }
-
     if (text === "promo:summary") {
       const visits = await getVisitasToday(actor.profile.promotor_id);
       const open = visits.filter((v) => !v.hora_fin).length;
@@ -833,104 +751,38 @@ async function handlePromotorChannel(actor, incoming, session) {
       const evidencias = await getEvidenciasTodayByExternalId(actor.profile.external_id);
       return {
         type: "text",
-        text:
-          `📊 *Resumen del día* (${todayISO()})\n\n` +
-          `🏬 Visitas: *${visits.length}*\n` +
-          `🟢 Abiertas: *${open}*\n` +
-          `✅ Cerradas: *${closed}*\n` +
-          `📸 Evidencias: *${evidencias.length}*`,
+        text: `📊 *Resumen del día* (${todayISO()})\n\n🏬 Visitas: *${visits.length}*\n🟢 Abiertas: *${open}*\n✅ Cerradas: *${closed}*\n📸 Evidencias: *${evidencias.length}*`,
       };
     }
   }
 
-  return {
-    type: "text",
-    text: mainMenu(Boolean(data?._pending_evid)),
-    reply_markup: buildPromotorKeyboard(),
-  };
+  return { type: "text", text: mainMenu(), reply_markup: buildPromotorKeyboard() };
 }
 
 async function handleSupervisorChannel(actor, incoming, session) {
   const text = norm(incoming.text).toLowerCase();
-
   if (text === "/start" || text === "/menu" || text === "/sup" || text === "sup") {
     await setSession(actor.profile.external_id, STATE_SUP_MENU, session.data_json || {});
-    return {
-      type: "text",
-      text: `👋 Hola, *${actor.profile.nombre}* (Supervisor).\n\nTu panel ya corre sobre Telegram.`,
-      reply_markup: buildSupervisorKeyboard(),
-    };
+    return { type: "text", text: `👋 Hola, *${actor.profile.nombre}* (Supervisor).\n\nTu panel ya corre sobre Telegram.`, reply_markup: buildSupervisorKeyboard() };
   }
-
-  if (incoming.updateType === "callback_query") {
-    switch (text) {
-      case "sup:asis": {
-        const equipo = await getPromotoresDeSupervisor(actor.profile.external_id);
-        return {
-          type: "text",
-          text: `🧑‍🤝‍🧑 Equipo detectado: *${equipo.length}* promotor(es).\n\nAbre el panel para ver asistencias HOY y detalle por visita.`,
-          reply_markup: {
-            inline_keyboard: [[{ text: "Abrir panel supervisor", web_app: { url: MINIAPP_BASE_URL || "https://example.com" } }]],
-          },
-        };
-      }
-      case "sup:alerts":
-        return {
-          type: "text",
-          text: "🚦 Alertas del día listas para consultarse en el panel supervisor.",
-          reply_markup: {
-            inline_keyboard: [[{ text: "Abrir alertas", web_app: { url: MINIAPP_BASE_URL || "https://example.com" } }]],
-          },
-        };
-      case "sup:evid":
-        return {
-          type: "text",
-          text: "📷 Evidencias del equipo listas para revisión fotográfica dentro de la Mini App.",
-          reply_markup: {
-            inline_keyboard: [[{ text: "Abrir revisión", web_app: { url: MINIAPP_BASE_URL || "https://example.com" } }]],
-          },
-        };
-      case "sup:cart":
-        return {
-          type: "text",
-          text: "🛒 El carrito ya se puede modelar desde el panel supervisor y luego publicar al cliente Telegram.",
-        };
-      default:
-        break;
-    }
-  }
-
-  return {
-    type: "text",
-    text: `👋 Hola, *${actor.profile.nombre}* (Supervisor).\n\nUsa el menú para continuar.`,
-    reply_markup: buildSupervisorKeyboard(),
-  };
+  return { type: "text", text: `👋 Hola, *${actor.profile.nombre}* (Supervisor).\n\nUsa el menú para continuar.`, reply_markup: buildSupervisorKeyboard() };
 }
 
 async function handleClienteChannel(_actor, incoming) {
   const text = norm(incoming.text).toLowerCase();
-
   if (text === "/start" || text === "/menu" || text === "menu") {
     return {
       type: "text",
-      text:
-        "👋 *Canal cliente*\n\n" +
-        "Aquí recibirás visitas aprobadas, fotos clave y acceso al expediente completo dentro de Telegram.",
+      text: "👋 *Canal cliente*\n\nAquí recibirás visitas aprobadas, fotos clave y acceso al expediente completo dentro de Telegram.",
       reply_markup: buildClienteKeyboard(),
     };
   }
-
-  return {
-    type: "text",
-    text: "Escribe /menu para abrir tu panel cliente.",
-    reply_markup: buildClienteKeyboard(),
-  };
+  return { type: "text", text: "Escribe /menu para abrir tu panel cliente.", reply_markup: buildClienteKeyboard() };
 }
 
 async function routeIncoming(incoming) {
   const actor = await resolveActor(incoming.senderHandle);
   const session = await getSession(actor.profile.external_id);
-
   if (actor.role === "promotor") return handlePromotorChannel(actor, incoming, session);
   if (actor.role === "supervisor") return handleSupervisorChannel(actor, incoming, session);
   return handleClienteChannel(actor, incoming, session);
@@ -938,21 +790,12 @@ async function routeIncoming(incoming) {
 
 async function respondToTelegram(incoming, response) {
   if (!response || !incoming.chatId) return;
-
-  if (incoming.callbackQueryId) {
-    await answerCallbackQuery(incoming.callbackQueryId, "OK");
-  }
-
+  if (incoming.callbackQueryId) await answerCallbackQuery(incoming.callbackQueryId, "OK");
   if (response.type === "photo") {
-    await sendTelegramPhoto(incoming.chatId, response.photo, response.caption || "", {
-      reply_markup: response.reply_markup,
-    });
+    await sendTelegramPhoto(incoming.chatId, response.photo, response.caption || "", { reply_markup: response.reply_markup });
     return;
   }
-
-  await sendTelegramText(incoming.chatId, response.text || "OK", {
-    reply_markup: response.reply_markup,
-  });
+  await sendTelegramText(incoming.chatId, response.text || "OK", { reply_markup: response.reply_markup });
 }
 
 function verifyTelegramWebAppInitData(initData) {
@@ -960,13 +803,8 @@ function verifyTelegramWebAppInitData(initData) {
   const params = new URLSearchParams(initData);
   const hash = params.get("hash");
   if (!hash) return false;
-
   params.delete("hash");
-  const dataCheckString = [...params.entries()]
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([key, value]) => `${key}=${value}`)
-    .join("\n");
-
+  const dataCheckString = [...params.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([key, value]) => `${key}=${value}`).join("\n");
   const secretKey = crypto.createHmac("sha256", "WebAppData").update(TELEGRAM_BOT_TOKEN).digest();
   const expectedHash = crypto.createHmac("sha256", secretKey).update(dataCheckString).digest("hex");
   return expectedHash === hash;
@@ -990,32 +828,11 @@ async function resolveActorFromInitData(initData) {
 async function requireMiniAppActor(req, res, next) {
   try {
     const initData = req.body?.initData || req.headers["x-telegram-init-data"] || req.query?.initData;
-
-    console.log("MiniApp auth start", {
-      origin: req.headers.origin || "",
-      referer: req.headers.referer || "",
-      hasInitData: Boolean(initData),
-      initDataLength: initData ? String(initData).length : 0,
-    });
-
     const actor = await resolveActorFromInitData(initData);
-
     if (!actor) {
-      console.warn("MiniApp auth rejected", {
-        origin: req.headers.origin || "",
-        referer: req.headers.referer || "",
-        hasInitData: Boolean(initData),
-      });
       res.status(401).json({ ok: false, error: "initData inválido" });
       return;
     }
-
-    console.log("MiniApp auth ok", {
-      role: actor.role,
-      externalId: actor.externalId,
-      telegramUserId: actor.telegramUser?.id || null,
-    });
-
     req.miniappActor = actor;
     next();
   } catch (error) {
@@ -1042,45 +859,25 @@ function buildEvidenceView(item, marcaMap, visitMap, tiendaMap) {
   };
 }
 
-app.post("/miniapp/bootstrap", requireMiniAppActor, async (req, res) => {
+app.post("/miniapp/bootstrap", requireMiniAppActor, asyncHandler(async (req, res) => {
   const actor = req.miniappActor;
+  res.json({ ok: true, role: actor.role, profile: actor.profile, telegramUser: actor.telegramUser, serverTime: nowISO(), today: todayISO() });
+}));
 
-  console.log("miniapp/bootstrap ok", {
-    role: actor.role,
-    externalId: actor.externalId,
-    telegramUserId: actor.telegramUser?.id || null,
-  });
-
-  res.json({
-    ok: true,
-    role: actor.role,
-    profile: actor.profile,
-    telegramUser: actor.telegramUser,
-    serverTime: nowISO(),
-    today: todayISO(),
-  });
-});
-
-app.post("/miniapp/promotor/dashboard", requireMiniAppActor, async (req, res) => {
+app.post("/miniapp/promotor/dashboard", requireMiniAppActor, asyncHandler(async (req, res) => {
   const actor = req.miniappActor;
-  if (actor.role !== "promotor") {
-    res.status(403).json({ ok: false, error: "solo_promotor" });
-    return;
-  }
+  if (actor.role !== "promotor") return res.status(403).json({ ok: false, error: "solo_promotor" });
 
   const tiendaMap = await getTiendaMap();
   const assignedStoreIds = await getTiendasAsignadas(actor.profile.promotor_id);
-  const assignedStores = assignedStoreIds
-    .map((id) => tiendaMap[id])
-    .filter(Boolean)
-    .map((store) => ({
-      tienda_id: store.tienda_id,
-      nombre_tienda: store.nombre_tienda,
-      cadena: store.cadena,
-      ciudad: store.ciudad,
-      cliente: store.cliente,
-      zona: store.zona,
-    }));
+  const assignedStores = assignedStoreIds.map((id) => tiendaMap[id]).filter(Boolean).map((store) => ({
+    tienda_id: store.tienda_id,
+    nombre_tienda: store.nombre_tienda,
+    cadena: store.cadena,
+    ciudad: store.ciudad,
+    cliente: store.cliente,
+    zona: store.zona,
+  }));
 
   const visitsToday = await getVisitasToday(actor.profile.promotor_id);
   const openVisits = visitsToday.filter((visit) => !visit.hora_fin);
@@ -1090,14 +887,8 @@ app.post("/miniapp/promotor/dashboard", requireMiniAppActor, async (req, res) =>
     ok: true,
     promotor: actor.profile,
     stores: assignedStores,
-    visitsToday: visitsToday.map((visit) => ({
-      ...visit,
-      tienda_nombre: tiendaMap[visit.tienda_id]?.nombre_tienda || visit.tienda_id,
-    })),
-    openVisits: openVisits.map((visit) => ({
-      ...visit,
-      tienda_nombre: tiendaMap[visit.tienda_id]?.nombre_tienda || visit.tienda_id,
-    })),
+    visitsToday: visitsToday.map((visit) => ({ ...visit, tienda_nombre: tiendaMap[visit.tienda_id]?.nombre_tienda || visit.tienda_id })),
+    openVisits: openVisits.map((visit) => ({ ...visit, tienda_nombre: tiendaMap[visit.tienda_id]?.nombre_tienda || visit.tienda_id })),
     summary: {
       assignedStores: assignedStores.length,
       openVisits: openVisits.length,
@@ -1105,41 +896,75 @@ app.post("/miniapp/promotor/dashboard", requireMiniAppActor, async (req, res) =>
       closedVisits: visitsToday.filter((visit) => visit.hora_fin).length,
     },
   });
-});
+}));
 
 app.post("/miniapp/promotor/start-entry", requireMiniAppActor, asyncHandler(async (req, res) => {
   const actor = req.miniappActor;
-  if (actor.role !== "promotor") {
-    res.status(403).json({ ok: false, error: "solo_promotor" });
-    return;
-  }
+  if (actor.role !== "promotor") return res.status(403).json({ ok: false, error: "solo_promotor" });
 
-  const {
-    tienda_id,
-    lat = "",
-    lon = "",
-    accuracy = "",
-    selfie_url = "",
-    foto_data_url = "",
-    foto_nombre = "",
-    notas = "",
-  } = req.body || {};
-
-  if (!tienda_id) {
-    res.status(400).json({ ok: false, error: "tienda_id requerido" });
-    return;
-  }
+  const { tienda_id, lat = "", lon = "", accuracy = "", selfie_url = "", foto_data_url = "", foto_nombre = "", notas = "" } = req.body || {};
+  if (!tienda_id) return res.status(400).json({ ok: false, error: "tienda_id requerido" });
 
   const existingOpen = await getOpenVisitsToday(actor.profile.promotor_id);
   const duplicated = existingOpen.find((visit) => visit.tienda_id === tienda_id);
-  if (duplicated) {
-    res.status(409).json({ ok: false, error: "ya_hay_visita_abierta", visita_id: duplicated.visita_id });
-    return;
-  }
+  if (duplicated) return res.status(409).json({ ok: false, error: "ya_hay_visita_abierta", visita_id: duplicated.visita_id });
 
   const visita_id = await createVisit(actor.profile.promotor_id, tienda_id, notas);
   const photoUrl = selfie_url || foto_data_url || "";
 
+  let warning = "";
+  if (photoUrl || lat || lon) {
+    const auxResult = await registrarEvidencia({
+      evidencia_id: `EV-${Date.now()}-ASIS-IN`,
+      external_id: actor.profile.external_id,
+      tipo_evento: "ASISTENCIA_ENTRADA",
+      origen: "ASISTENCIA",
+      visita_id,
+      url_foto: photoUrl,
+      lat,
+      lon,
+      tipo_evidencia: "ASISTENCIA",
+      descripcion: "[TELEGRAM_MINIAPP_ENTRADA]",
+      riesgo: "BAJO",
+      score_confianza: 0.93,
+      resultado_ai: "Entrada validada (demo)",
+      status: "ACTIVA",
+      note: "",
+      fase: "NA",
+      foto_nombre,
+      accuracy,
+    });
+
+    if (auxResult.photoOverflow) {
+      warning = "attendance_photo_too_large_for_sheets";
+      console.warn("attendance evidence photo overflow (entry)", {
+        visita_id,
+        tienda_id,
+        originalPhotoLength: auxResult.originalPhotoLength,
+      });
+    }
+  }
+
+  const storeMap = await getTiendaMap();
+  res.json({ ok: true, visita_id, tienda_id, tienda_nombre: storeMap[tienda_id]?.nombre_tienda || tienda_id, started_at: nowISO(), warning });
+}));
+
+app.post("/miniapp/promotor/close-visit", requireMiniAppActor, asyncHandler(async (req, res) => {
+  const actor = req.miniappActor;
+  if (actor.role !== "promotor") return res.status(403).json({ ok: false, error: "solo_promotor" });
+
+  const { visita_id, lat = "", lon = "", accuracy = "", selfie_url = "", foto_data_url = "", foto_nombre = "", notas = "" } = req.body || {};
+  if (!visita_id) return res.status(400).json({ ok: false, error: "visita_id requerido" });
+
+  const visit = await getVisitById(visita_id);
+  if (!visit || visit.promotor_id !== actor.profile.promotor_id) {
+    return res.status(404).json({ ok: false, error: "visita_no_encontrada" });
+  }
+
+  await closeVisitById(visita_id, notas);
+  const photoUrl = selfie_url || foto_data_url || "";
+
+  let warning = "";
   if (photoUrl || lat || lon) {
     const auxResult = await registrarEvidencia({
       evidencia_id: `EV-${Date.now()}-ASIS-OUT`,
@@ -1163,6 +988,7 @@ app.post("/miniapp/promotor/start-entry", requireMiniAppActor, asyncHandler(asyn
     });
 
     if (auxResult.photoOverflow) {
+      warning = "attendance_photo_too_large_for_sheets";
       console.warn("attendance evidence photo overflow (exit)", {
         visita_id,
         originalPhotoLength: auxResult.originalPhotoLength,
@@ -1170,128 +996,65 @@ app.post("/miniapp/promotor/start-entry", requireMiniAppActor, asyncHandler(asyn
     }
   }
 
-  const photoInfo = normalizePhotoForSheet(photoUrl);
-  res.json({ ok: true, visita_id, closed_at: nowISO(), warning: photoInfo.overflow ? "attendance_photo_too_large_for_sheets" : "" });
+  res.json({ ok: true, visita_id, closed_at: nowISO(), warning });
 }));
 
-app.post("/miniapp/promotor/evidence-context", requireMiniAppActor, async (req, res) => {
+app.post("/miniapp/promotor/evidence-context", requireMiniAppActor, asyncHandler(async (req, res) => {
   const actor = req.miniappActor;
-  if (actor.role !== "promotor") {
-    res.status(403).json({ ok: false, error: "solo_promotor" });
-    return;
-  }
+  if (actor.role !== "promotor") return res.status(403).json({ ok: false, error: "solo_promotor" });
 
   const { visita_id } = req.body || {};
-  if (!visita_id) {
-    res.status(400).json({ ok: false, error: "visita_id requerido" });
-    return;
-  }
+  if (!visita_id) return res.status(400).json({ ok: false, error: "visita_id requerido" });
 
   const visit = await getVisitById(visita_id);
-  if (!visit || visit.promotor_id !== actor.profile.promotor_id) {
-    res.status(404).json({ ok: false, error: "visita_no_encontrada" });
-    return;
-  }
+  if (!visit || visit.promotor_id !== actor.profile.promotor_id) return res.status(404).json({ ok: false, error: "visita_no_encontrada" });
 
   const marcas = await getMarcasActivas();
   const storeMap = await getTiendaMap();
-  res.json({
-    ok: true,
-    visita: {
-      ...visit,
-      tienda_nombre: storeMap[visit.tienda_id]?.nombre_tienda || visit.tienda_id,
-    },
-    marcas,
-  });
-});
+  res.json({ ok: true, visita: { ...visit, tienda_nombre: storeMap[visit.tienda_id]?.nombre_tienda || visit.tienda_id }, marcas });
+}));
 
-app.post("/miniapp/promotor/evidence-rules", requireMiniAppActor, async (req, res) => {
+app.post("/miniapp/promotor/evidence-rules", requireMiniAppActor, asyncHandler(async (req, res) => {
   const actor = req.miniappActor;
-  if (actor.role !== "promotor") {
-    res.status(403).json({ ok: false, error: "solo_promotor" });
-    return;
-  }
+  if (actor.role !== "promotor") return res.status(403).json({ ok: false, error: "solo_promotor" });
 
   const { marca_id, marca_nombre = "" } = req.body || {};
   let resolvedMarcaId = norm(marca_id);
-  if (!resolvedMarcaId && marca_nombre) {
-    resolvedMarcaId = await resolveMarcaIdByName(marca_nombre);
-  }
-  if (!resolvedMarcaId) {
-    res.status(400).json({ ok: false, error: "marca_id requerido" });
-    return;
-  }
+  if (!resolvedMarcaId && marca_nombre) resolvedMarcaId = await resolveMarcaIdByName(marca_nombre);
+  if (!resolvedMarcaId) return res.status(400).json({ ok: false, error: "marca_id requerido" });
 
   const reglas = await getReglasPorMarca(resolvedMarcaId);
   res.json({ ok: true, reglas });
-});
+}));
 
 app.post("/miniapp/promotor/evidence-register", requireMiniAppActor, asyncHandler(async (req, res) => {
   const actor = req.miniappActor;
-  if (actor.role !== "promotor") {
-    res.status(403).json({ ok: false, error: "solo_promotor" });
-    return;
-  }
+  if (actor.role !== "promotor") return res.status(403).json({ ok: false, error: "solo_promotor" });
 
-  const {
-    visita_id,
-    marca_id = "",
-    marca_nombre = "",
-    tipo_evidencia,
-    fase = "NA",
-    descripcion = "",
-    lat = "",
-    lon = "",
-    accuracy = "",
-    fotos = [],
-    foto_data_url = "",
-    foto_nombre = "",
-  } = req.body || {};
-
-  if (!visita_id || !tipo_evidencia) {
-    res.status(400).json({ ok: false, error: "payload_incompleto" });
-    return;
-  }
+  const { visita_id, marca_id = "", marca_nombre = "", tipo_evidencia, descripcion = "", lat = "", lon = "", accuracy = "", fase = "NA", fotos = [], foto_data_url = "", foto_nombre = "" } = req.body || {};
+  if (!visita_id || !tipo_evidencia) return res.status(400).json({ ok: false, error: "payload_incompleto" });
 
   const visit = await getVisitById(visita_id);
-  if (!visit || visit.promotor_id !== actor.profile.promotor_id) {
-    res.status(404).json({ ok: false, error: "visita_no_encontrada" });
-    return;
-  }
+  if (!visit || visit.promotor_id !== actor.profile.promotor_id) return res.status(404).json({ ok: false, error: "visita_no_encontrada" });
 
   let resolvedMarcaId = norm(marca_id);
-  if (!resolvedMarcaId && marca_nombre) {
-    resolvedMarcaId = await resolveMarcaIdByName(marca_nombre);
-  }
-  if (!resolvedMarcaId && marca_nombre) {
-    resolvedMarcaId = marca_nombre;
-  }
+  if (!resolvedMarcaId && marca_nombre) resolvedMarcaId = await resolveMarcaIdByName(marca_nombre);
+  if (!resolvedMarcaId && marca_nombre) resolvedMarcaId = marca_nombre;
 
-  const finalFotos = Array.isArray(fotos) && fotos.length
-    ? fotos
-    : (foto_data_url ? [{ dataUrl: foto_data_url, name: foto_nombre || "evidencia.jpg" }] : []);
-
-  if (!finalFotos.length) {
-    res.status(400).json({ ok: false, error: "fotos_requeridas" });
-    return;
-  }
+  const finalFotos = Array.isArray(fotos) && fotos.length ? fotos : (foto_data_url ? [{ dataUrl: foto_data_url, name: foto_nombre || "evidencia.jpg" }] : []);
+  if (!finalFotos.length) return res.status(400).json({ ok: false, error: "fotos_requeridas" });
 
   if (resolvedMarcaId) {
     const reglas = await getReglasPorMarca(resolvedMarcaId);
     const reglaMatch = reglas.find((item) => upper(item.tipo_evidencia) === upper(tipo_evidencia));
     if (reglaMatch && finalFotos.length < reglaMatch.fotos_requeridas) {
-      res.status(400).json({
-        ok: false,
-        error: "fotos_insuficientes",
-        expected: reglaMatch.fotos_requeridas,
-        received: finalFotos.length,
-      });
-      return;
+      return res.status(400).json({ ok: false, error: "fotos_insuficientes", expected: reglaMatch.fotos_requeridas, received: finalFotos.length });
     }
   }
 
   const tipo_evento = `EVIDENCIA_${upper(tipo_evidencia).replace(/\W+/g, "_")}`;
   const created = [];
+  let photoOverflow = false;
 
   for (let i = 0; i < finalFotos.length; i += 1) {
     const foto = finalFotos[i];
@@ -1318,6 +1081,7 @@ app.post("/miniapp/promotor/evidence-register", requireMiniAppActor, asyncHandle
       foto_nombre: pickPhotoName(foto, foto_nombre || `evidencia_${i + 1}.jpg`),
     });
     if (regResult.photoOverflow) {
+      photoOverflow = true;
       console.warn("evidence photo overflow", {
         evidencia_id,
         visita_id,
@@ -1327,80 +1091,49 @@ app.post("/miniapp/promotor/evidence-register", requireMiniAppActor, asyncHandle
     created.push(evidencia_id);
   }
 
-  res.json({
-    ok: true,
-    visita_id,
-    created,
-    count: created.length,
-  });
+  res.json({ ok: true, visita_id, created, count: created.length, warning: photoOverflow ? "evidence_photo_too_large_for_sheets" : "" });
 }));
 
 app.post("/miniapp/promotor/evidences-today", requireMiniAppActor, asyncHandler(async (req, res) => {
   const actor = req.miniappActor;
-  if (actor.role !== "promotor") {
-    res.status(403).json({ ok: false, error: "solo_promotor" });
-    return;
-  }
+  if (actor.role !== "promotor") return res.status(403).json({ ok: false, error: "solo_promotor" });
 
   const marcaMap = await getMarcaMap();
   const visitMap = await getAllVisitsMap();
   const tiendaMap = await getTiendaMap();
   const evidencias = await getEvidenciasTodayByExternalId(actor.profile.external_id);
-
-  res.json({
-    ok: true,
-    evidencias: evidencias.map((item) => buildEvidenceView(item, marcaMap, visitMap, tiendaMap)),
-  });
+  res.json({ ok: true, evidencias: evidencias.map((item) => buildEvidenceView(item, marcaMap, visitMap, tiendaMap)) });
 }));
 
 app.post("/miniapp/promotor/evidence-note", requireMiniAppActor, asyncHandler(async (req, res) => {
   const actor = req.miniappActor;
-  if (actor.role !== "promotor") {
-    res.status(403).json({ ok: false, error: "solo_promotor" });
-    return;
-  }
+  if (actor.role !== "promotor") return res.status(403).json({ ok: false, error: "solo_promotor" });
 
   const { evidencia_id, note = "" } = req.body || {};
-  if (!evidencia_id) {
-    res.status(400).json({ ok: false, error: "evidencia_id requerido" });
-    return;
-  }
+  if (!evidencia_id) return res.status(400).json({ ok: false, error: "evidencia_id requerido" });
 
   const evidence = await getEvidenceById(evidencia_id);
-  if (!evidence || evidence.external_id !== actor.profile.external_id) {
-    res.status(404).json({ ok: false, error: "evidencia_no_encontrada" });
-    return;
-  }
+  if (!evidence || evidence.external_id !== actor.profile.external_id) return res.status(404).json({ ok: false, error: "evidencia_no_encontrada" });
 
-  await updateEvidenceRow(evidence, {
-    note,
-  });
-
+  await updateEvidenceRow(evidence, { note });
   res.json({ ok: true, evidencia_id, note });
 }));
 
 app.post("/miniapp/promotor/cancel-evidence", requireMiniAppActor, asyncHandler(async (req, res) => {
   const actor = req.miniappActor;
-  if (actor.role !== "promotor") {
-    res.status(403).json({ ok: false, error: "solo_promotor" });
-    return;
-  }
+  if (actor.role !== "promotor") return res.status(403).json({ ok: false, error: "solo_promotor" });
 
   const { evidencia_id, note = "" } = req.body || {};
-  if (!evidencia_id) {
-    res.status(400).json({ ok: false, error: "evidencia_id requerido" });
-    return;
-  }
+  if (!evidencia_id) return res.status(400).json({ ok: false, error: "evidencia_id requerido" });
 
   const evidence = await getEvidenceById(evidencia_id);
-  if (!evidence || evidence.external_id !== actor.profile.external_id) {
-    res.status(404).json({ ok: false, error: "evidencia_no_encontrada" });
-    return;
-  }
+  if (!evidence || evidence.external_id !== actor.profile.external_id) return res.status(404).json({ ok: false, error: "evidencia_no_encontrada" });
 
   await updateEvidenceRow(evidence, {
     status: "ANULADA",
-    note: note || evidence.note,
+    note,
+    resultado_ai: "ANULADA_MANUAL",
+    riesgo: "BAJO",
   });
 
   res.json({ ok: true, evidencia_id, status: "ANULADA" });
@@ -1408,61 +1141,34 @@ app.post("/miniapp/promotor/cancel-evidence", requireMiniAppActor, asyncHandler(
 
 app.post("/miniapp/promotor/replace-evidence", requireMiniAppActor, asyncHandler(async (req, res) => {
   const actor = req.miniappActor;
-  if (actor.role !== "promotor") {
-    res.status(403).json({ ok: false, error: "solo_promotor" });
-    return;
-  }
+  if (actor.role !== "promotor") return res.status(403).json({ ok: false, error: "solo_promotor" });
 
-  const {
-    evidencia_id,
-    url_foto = "",
-    foto_data_url = "",
-    foto_nombre = "",
-    resultado_ai = "",
-    score_confianza = "",
-    riesgo = "",
-  } = req.body || {};
-
-  if (!evidencia_id) {
-    res.status(400).json({ ok: false, error: "evidencia_id requerido" });
-    return;
-  }
+  const { evidencia_id, url_foto = "", foto_data_url = "", foto_nombre = "", resultado_ai = "", score_confianza = "", riesgo = "" } = req.body || {};
+  if (!evidencia_id) return res.status(400).json({ ok: false, error: "evidencia_id requerido" });
 
   const evidence = await getEvidenceById(evidencia_id);
-  if (!evidence || evidence.external_id !== actor.profile.external_id) {
-    res.status(404).json({ ok: false, error: "evidencia_no_encontrada" });
-    return;
-  }
+  if (!evidence || evidence.external_id !== actor.profile.external_id) return res.status(404).json({ ok: false, error: "evidencia_no_encontrada" });
 
   const newPhotoUrl = url_foto || foto_data_url;
-  if (!newPhotoUrl) {
-    res.status(400).json({ ok: false, error: "foto_requerida" });
-    return;
-  }
+  if (!newPhotoUrl) return res.status(400).json({ ok: false, error: "foto_requerida" });
 
-  await updateEvidenceRow(evidence, {
+  const result = await updateEvidenceRow(evidence, {
     url_foto: newPhotoUrl,
     fecha_hora: nowISO(),
     foto_nombre: foto_nombre || evidence.foto_nombre,
     resultado_ai: resultado_ai || evidence.resultado_ai,
     score_confianza: score_confianza || evidence.score_confianza,
     riesgo: riesgo || evidence.riesgo,
-    status: "ACTIVA",
   });
 
-  res.json({ ok: true, evidencia_id, replaced: true });
+  res.json({ ok: true, evidencia_id, replaced: true, warning: result.photoOverflow ? "evidence_photo_too_large_for_sheets" : "" });
 }));
 
-app.post("/miniapp/supervisor/dashboard", requireMiniAppActor, async (req, res) => {
+app.post("/miniapp/supervisor/dashboard", requireMiniAppActor, asyncHandler(async (req, res) => {
   const actor = req.miniappActor;
-  if (actor.role !== "supervisor") {
-    res.status(403).json({ ok: false, error: "solo_supervisor" });
-    return;
-  }
-
+  if (actor.role !== "supervisor") return res.status(403).json({ ok: false, error: "solo_supervisor" });
   const equipo = await getPromotoresDeSupervisor(actor.profile.external_id);
   const byPromotor = [];
-
   for (const promotor of equipo) {
     const visits = await getVisitasToday(promotor.promotor_id);
     const evidencias = await getEvidenciasTodayByExternalId(promotor.external_id);
@@ -1477,127 +1183,62 @@ app.post("/miniapp/supervisor/dashboard", requireMiniAppActor, async (req, res) 
       alertas_riesgo: evidencias.filter((item) => item.riesgo === "ALTO" || item.riesgo === "MEDIO").length,
     });
   }
+  res.json({ ok: true, supervisor: actor.profile, equipo: byPromotor, resumen: { promotores: byPromotor.length, evidenciasHoy: byPromotor.reduce((acc, item) => acc + item.evidencias_hoy, 0), alertas: byPromotor.reduce((acc, item) => acc + item.alertas_riesgo, 0) } });
+}));
 
-  res.json({
-    ok: true,
-    supervisor: actor.profile,
-    equipo: byPromotor,
-    resumen: {
-      promotores: byPromotor.length,
-      evidenciasHoy: byPromotor.reduce((acc, item) => acc + item.evidencias_hoy, 0),
-      alertas: byPromotor.reduce((acc, item) => acc + item.alertas_riesgo, 0),
-    },
-  });
-});
-
-app.post("/miniapp/supervisor/promotor-detail", requireMiniAppActor, async (req, res) => {
+app.post("/miniapp/supervisor/promotor-detail", requireMiniAppActor, asyncHandler(async (req, res) => {
   const actor = req.miniappActor;
-  if (actor.role !== "supervisor") {
-    res.status(403).json({ ok: false, error: "solo_supervisor" });
-    return;
-  }
-
+  if (actor.role !== "supervisor") return res.status(403).json({ ok: false, error: "solo_supervisor" });
   const { promotor_external_id } = req.body || {};
-  if (!promotor_external_id) {
-    res.status(400).json({ ok: false, error: "promotor_external_id requerido" });
-    return;
-  }
-
+  if (!promotor_external_id) return res.status(400).json({ ok: false, error: "promotor_external_id requerido" });
   const promotor = await getPromotorByExternalId(promotor_external_id);
-  if (!promotor || promotor.supervisor_external_id !== actor.profile.external_id) {
-    res.status(404).json({ ok: false, error: "promotor_no_encontrado" });
-    return;
-  }
-
+  if (!promotor || promotor.supervisor_external_id !== actor.profile.external_id) return res.status(404).json({ ok: false, error: "promotor_no_encontrado" });
   const tiendaMap = await getTiendaMap();
   const visits = await getVisitasToday(promotor.promotor_id);
   const marcaMap = await getMarcaMap();
   const visitMap = await getAllVisitsMap();
   const evidencias = await getEvidenciasTodayByExternalId(promotor.external_id);
-
   res.json({
     ok: true,
     promotor,
-    visitas: visits.map((visit) => ({
-      ...visit,
-      tienda_nombre: tiendaMap[visit.tienda_id]?.nombre_tienda || visit.tienda_id,
-      hora_inicio_fmt: fmtDateTimeTZ(visit.hora_inicio),
-      hora_fin_fmt: visit.hora_fin ? fmtDateTimeTZ(visit.hora_fin) : "pendiente",
-    })),
+    visitas: visits.map((visit) => ({ ...visit, tienda_nombre: tiendaMap[visit.tienda_id]?.nombre_tienda || visit.tienda_id, hora_inicio_fmt: fmtDateTimeTZ(visit.hora_inicio), hora_fin_fmt: visit.hora_fin ? fmtDateTimeTZ(visit.hora_fin) : "pendiente" })),
     evidencias: evidencias.map((item) => buildEvidenceView(item, marcaMap, visitMap, tiendaMap)),
   });
-});
+}));
 
-app.post("/miniapp/supervisor/visit-expedient", requireMiniAppActor, async (req, res) => {
+app.post("/miniapp/supervisor/visit-expedient", requireMiniAppActor, asyncHandler(async (req, res) => {
   const actor = req.miniappActor;
-  if (actor.role !== "supervisor") {
-    res.status(403).json({ ok: false, error: "solo_supervisor" });
-    return;
-  }
-
+  if (actor.role !== "supervisor") return res.status(403).json({ ok: false, error: "solo_supervisor" });
   const { visita_id } = req.body || {};
-  if (!visita_id) {
-    res.status(400).json({ ok: false, error: "visita_id requerido" });
-    return;
-  }
-
+  if (!visita_id) return res.status(400).json({ ok: false, error: "visita_id requerido" });
   const visit = await getVisitById(visita_id);
-  if (!visit) {
-    res.status(404).json({ ok: false, error: "visita_no_encontrada" });
-    return;
-  }
-
+  if (!visit) return res.status(404).json({ ok: false, error: "visita_no_encontrada" });
   const promotorRows = await getPromotoresDeSupervisor(actor.profile.external_id);
   const allowedIds = new Set(promotorRows.map((item) => item.promotor_id));
-  if (!allowedIds.has(visit.promotor_id)) {
-    res.status(403).json({ ok: false, error: "sin_acceso" });
-    return;
-  }
-
+  if (!allowedIds.has(visit.promotor_id)) return res.status(403).json({ ok: false, error: "sin_acceso" });
   const tiendaMap = await getTiendaMap();
   const marcaMap = await getMarcaMap();
   const visitMap = await getAllVisitsMap();
   const evidencias = await getEvidenciasByVisitId(visita_id);
-
   res.json({
     ok: true,
-    visita: {
-      ...visit,
-      tienda_nombre: tiendaMap[visit.tienda_id]?.nombre_tienda || visit.tienda_id,
-      hora_inicio_fmt: fmtDateTimeTZ(visit.hora_inicio),
-      hora_fin_fmt: visit.hora_fin ? fmtDateTimeTZ(visit.hora_fin) : "pendiente",
-    },
+    visita: { ...visit, tienda_nombre: tiendaMap[visit.tienda_id]?.nombre_tienda || visit.tienda_id, hora_inicio_fmt: fmtDateTimeTZ(visit.hora_inicio), hora_fin_fmt: visit.hora_fin ? fmtDateTimeTZ(visit.hora_fin) : "pendiente" },
     evidencias: evidencias.map((item) => buildEvidenceView(item, marcaMap, visitMap, tiendaMap)),
   });
-});
+}));
 
-app.post("/miniapp/client/expedient", requireMiniAppActor, async (req, res) => {
+app.post("/miniapp/client/expedient", requireMiniAppActor, asyncHandler(async (req, res) => {
   const { visita_id } = req.body || {};
-  if (!visita_id) {
-    res.status(400).json({ ok: false, error: "visita_id requerido" });
-    return;
-  }
-
+  if (!visita_id) return res.status(400).json({ ok: false, error: "visita_id requerido" });
   const visit = await getVisitById(visita_id);
-  if (!visit) {
-    res.status(404).json({ ok: false, error: "visita_no_encontrada" });
-    return;
-  }
-
+  if (!visit) return res.status(404).json({ ok: false, error: "visita_no_encontrada" });
   const tiendaMap = await getTiendaMap();
   const marcaMap = await getMarcaMap();
   const visitMap = await getAllVisitsMap();
   const evidencias = await getEvidenciasByVisitId(visita_id);
-
   res.json({
     ok: true,
-    visita: {
-      ...visit,
-      tienda_nombre: tiendaMap[visit.tienda_id]?.nombre_tienda || visit.tienda_id,
-      cliente: tiendaMap[visit.tienda_id]?.cliente || "",
-      hora_inicio_fmt: fmtDateTimeTZ(visit.hora_inicio),
-      hora_fin_fmt: visit.hora_fin ? fmtDateTimeTZ(visit.hora_fin) : "pendiente",
-    },
+    visita: { ...visit, tienda_nombre: tiendaMap[visit.tienda_id]?.nombre_tienda || visit.tienda_id, cliente: tiendaMap[visit.tienda_id]?.cliente || "", hora_inicio_fmt: fmtDateTimeTZ(visit.hora_inicio), hora_fin_fmt: visit.hora_fin ? fmtDateTimeTZ(visit.hora_fin) : "pendiente" },
     evidencias: evidencias.map((item) => buildEvidenceView(item, marcaMap, visitMap, tiendaMap)),
     resumen: {
       total: evidencias.length,
@@ -1606,93 +1247,55 @@ app.post("/miniapp/client/expedient", requireMiniAppActor, async (req, res) => {
       riesgo_bajo: evidencias.filter((item) => item.riesgo === "BAJO").length,
     },
   });
-});
+}));
 
-app.post("/internal/client/publish-expedient", async (req, res) => {
-  try {
-    const { chat_id, visita_id, headline = "Visita completada" } = req.body || {};
-    if (!chat_id || !visita_id) {
-      res.status(400).json({ ok: false, error: "chat_id y visita_id requeridos" });
-      return;
-    }
-
-    const visit = await getVisitById(visita_id);
-    if (!visit) {
-      res.status(404).json({ ok: false, error: "visita_no_encontrada" });
-      return;
-    }
-
-    const tiendaMap = await getTiendaMap();
-    const evidencias = await getEvidenciasByVisitId(visita_id);
-    const cover = evidencias.find((item) => item.url_foto) || evidencias[0];
-
-    const text =
-      `📦 *${headline}*\n\n` +
-      `🏬 *Tienda:* ${tiendaMap[visit.tienda_id]?.nombre_tienda || visit.tienda_id}\n` +
-      `📅 *Fecha:* ${visit.fecha}\n` +
-      `📸 *Evidencias:* ${evidencias.length}\n\n` +
-      "Abre el expediente completo desde la Mini App.";
-
-    if (cover?.url_foto) {
-      await sendTelegramPhoto(chat_id, cover.url_foto, text, { reply_markup: buildClienteKeyboard() });
-    } else {
-      await sendTelegramText(chat_id, text, { reply_markup: buildClienteKeyboard() });
-    }
-
-    res.json({ ok: true, sent: true, visita_id });
-  } catch (error) {
-    console.error("client publish error", error);
-    res.status(500).json({ ok: false, error: error.message || "publish_failed" });
+app.post("/internal/client/publish-expedient", asyncHandler(async (req, res) => {
+  const { chat_id, visita_id, headline = "Visita completada" } = req.body || {};
+  if (!chat_id || !visita_id) return res.status(400).json({ ok: false, error: "chat_id y visita_id requeridos" });
+  const visit = await getVisitById(visita_id);
+  if (!visit) return res.status(404).json({ ok: false, error: "visita_no_encontrada" });
+  const tiendaMap = await getTiendaMap();
+  const evidencias = await getEvidenciasByVisitId(visita_id);
+  const cover = evidencias.find((item) => item.url_foto && !item.url_foto.startsWith("[IMAGE_TOO_LARGE_FOR_SHEETS]")) || evidencias[0];
+  const text = `📦 *${headline}*\n\n🏬 *Tienda:* ${tiendaMap[visit.tienda_id]?.nombre_tienda || visit.tienda_id}\n📅 *Fecha:* ${visit.fecha}\n📸 *Evidencias:* ${evidencias.length}\n\nAbre el expediente completo desde la Mini App.`;
+  if (cover?.url_foto) {
+    await sendTelegramPhoto(chat_id, cover.url_foto, text, { reply_markup: buildClienteKeyboard() });
+  } else {
+    await sendTelegramText(chat_id, text, { reply_markup: buildClienteKeyboard() });
   }
-});
+  res.json({ ok: true, sent: true, visita_id });
+}));
 
-app.post("/telegram/webhook", async (req, res) => {
+app.post("/telegram/webhook", asyncHandler(async (req, res) => {
   if (TELEGRAM_WEBHOOK_SECRET) {
     const token = req.headers["x-telegram-bot-api-secret-token"];
-    if (token !== TELEGRAM_WEBHOOK_SECRET) {
-      res.status(401).json({ ok: false, error: "invalid_secret" });
-      return;
-    }
+    if (token !== TELEGRAM_WEBHOOK_SECRET) return res.status(401).json({ ok: false, error: "invalid_secret" });
   }
-
   const incoming = parseTelegramUpdate(req.body || {});
-  console.log("Telegram senderHandle:", incoming.senderHandle, "text:", incoming.text);
-  if (!incoming.senderHandle) {
-    res.json({ ok: true, ignored: true });
-    return;
-  }
-
+  if (!incoming.senderHandle) return res.json({ ok: true, ignored: true });
   await withUserLock(incoming.senderHandle, async () => {
     try {
       const response = await routeIncoming(incoming);
       await respondToTelegram(incoming, response);
     } catch (error) {
       console.error("telegram webhook error", error);
-      if (incoming.chatId) {
-        await sendTelegramText(incoming.chatId, "Ocurrió un error procesando tu mensaje. Intenta de nuevo 🙏");
-      }
+      if (incoming.chatId) await sendTelegramText(incoming.chatId, "Ocurrió un error procesando tu mensaje. Intenta de nuevo 🙏");
     }
   });
-
   res.json({ ok: true });
-});
+}));
 
-app.post("/telegram/set-webhook", async (req, res) => {
-  try {
-    const baseUrl = buildBaseUrl(req);
-    const webhookUrl = `${baseUrl}/telegram/webhook`;
-    const payload = { url: webhookUrl };
-    if (TELEGRAM_WEBHOOK_SECRET) payload.secret_token = TELEGRAM_WEBHOOK_SECRET;
-    const result = await telegramApi("setWebhook", payload);
-    res.json({ ok: true, webhookUrl, result });
-  } catch (error) {
-    console.error("setWebhook error", error);
-    res.status(500).json({ ok: false, error: error.message });
-  }
-});
+app.post("/telegram/set-webhook", asyncHandler(async (req, res) => {
+  const baseUrl = buildBaseUrl(req);
+  const webhookUrl = `${baseUrl}/telegram/webhook`;
+  const payload = { url: webhookUrl };
+  if (TELEGRAM_WEBHOOK_SECRET) payload.secret_token = TELEGRAM_WEBHOOK_SECRET;
+  const result = await telegramApi("setWebhook", payload);
+  res.json({ ok: true, webhookUrl, result });
+}));
 
 app.get("/", (_req, res) => {
-  res.send("Promobolsillo+ Telegram backend v3 ✅");
+  res.send("Promobolsillo+ Telegram backend v3.3 ✅");
 });
 
 app.get("/health", (_req, res) => {
