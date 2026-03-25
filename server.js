@@ -1407,6 +1407,22 @@ app.get("/", async (_req, res) => {
 app.post("/telegram/webhook", async (req, res) => {
   try {
     const incoming = parseTelegramUpdate(req.body || {});
+    console.log("TG_USER", {
+      id: incoming.fromId,
+      external_id: incoming.fromId ? `telegram:${incoming.fromId}` : "",
+      text: incoming.text,
+      type: incoming.type,
+    });
+
+    if (norm(incoming.text).toLowerCase() === "/whoami") {
+      if (incoming.chatId && incoming.fromId) {
+        await sendTelegramText(
+          incoming.chatId,
+          `telegram_id: ${incoming.fromId}\nexternal_id: telegram:${incoming.fromId}`
+        );
+      }
+      return res.json({ ok: true });
+    }
     if (!incoming.chatId || !incoming.fromId) return res.json({ ok: true, ignored: true });
     const externalId = buildExternalIdFromTelegramUser(incoming.fromId);
     const actor = await resolveActor(externalId);
