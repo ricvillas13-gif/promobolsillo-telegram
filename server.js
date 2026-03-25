@@ -735,8 +735,7 @@ async function notifySupervisorAlert(payload) {
       `Severidad: *${payload.severidad || "MEDIA"}*`,
       `Tienda: *${tiendaNombre}*`,
       payload.descripcion ? `Detalle: ${payload.descripcion}` : "",
-    ].filter(Boolean).join("
-");
+    ].filter(Boolean).join("\n");
     await sendTelegramText(chatId, text, { inline_keyboard: [[{ text: "Abrir panel", web_app: { url: getMiniAppUrl() } }]] });
     return true;
   } catch (error) {
