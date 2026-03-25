@@ -972,14 +972,27 @@ async function getReglasPorMarca(marcaId) {
   }
   const catalog = await getTiposEvidenciaCatalog();
   const merged = [];
-  const byType = new Set();
-  rules.forEach((rule) => {
-    byType.add(upper(rule.tipo_evidencia));
+  const byType = new Map();
+
+  const pushUniqueRule = (rule) => {
+    const key = upper(rule.tipo_evidencia);
+    if (!key) return;
+    if (byType.has(key)) {
+      const existing = byType.get(key);
+      if (existing.origen === "TIPOS_EVIDENCIA" && rule.origen === "REGLAS_EVIDENCIA") {
+        const idx = merged.findIndex((item) => upper(item.tipo_evidencia) === key);
+        if (idx >= 0) merged[idx] = rule;
+        byType.set(key, rule);
+      }
+      return;
+    }
+    byType.set(key, rule);
     merged.push(rule);
-  });
+  };
+
+  rules.forEach((rule) => pushUniqueRule(rule));
   catalog.forEach((item) => {
-    if (byType.has(upper(item.tipo_evidencia))) return;
-    merged.push({
+    pushUniqueRule({
       marca_id: marcaId,
       tipo_evidencia: item.tipo_evidencia,
       fotos_requeridas: item.fotos_requeridas || 1,
@@ -988,6 +1001,7 @@ async function getReglasPorMarca(marcaId) {
       origen: "TIPOS_EVIDENCIA",
     });
   });
+
   return merged;
 }
 
@@ -1042,16 +1056,16 @@ function evidenceStatusForAnalysis(evidence, requiresReview) {
   return current || "RECIBIDA";
 }
 
-async function analyzeEvidencePlusV1(evidence) {
-  const visit = evidence.visita_id ? await getVisitById(evidence.visita_id) : null;
-  const sameVisit = evidence.visita_id ? await getEvidenciasByVisitId(evidence.visita_id) : [];
+function computeEvidencePlusAnalysis(evidence, context = {}) {
+  const visit = context.visit || null;
+  const sameVisit = Array.isArray(context.sameVisit) ? context.sameVisit : [];
+  const reglas = Array.isArray(context.reglas) ? context.reglas : [];
   const activeSameVisit = sameVisit.filter((item) => upper(item.status) !== "ANULADA");
   const activeSameGroup = activeSameVisit.filter((item) =>
     upper(item.marca_id) === upper(evidence.marca_id) &&
     upper(item.tipo_evidencia) === upper(evidence.tipo_evidencia) &&
     upper(item.fase || "NA") === upper(evidence.fase || "NA")
   );
-  const reglas = evidence.marca_id ? await getReglasPorMarca(evidence.marca_id) : [];
   const regla = reglas.find((rule) => upper(rule.tipo_evidencia) === upper(evidence.tipo_evidencia));
   const expectedPhotos = safeInt(regla?.fotos_requeridas, 1);
   const requiereFase = Boolean(regla?.requiere_antes_despues);
@@ -1182,6 +1196,13 @@ async function analyzeEvidencePlusV1(evidence) {
   };
 }
 
+async function analyzeEvidencePlusV1(evidence) {
+  const visit = evidence.visita_id ? await getVisitById(evidence.visita_id) : null;
+  const sameVisit = evidence.visita_id ? await getEvidenciasByVisitId(evidence.visita_id) : [];
+  const reglas = evidence.marca_id ? await getReglasPorMarca(evidence.marca_id) : [];
+  return computeEvidencePlusAnalysis(evidence, { visit, sameVisit, reglas });
+}
+
 async function applyEvidencePlusResult(evidenciaId, analysis) {
   const found = await getEvidenceById(evidenciaId);
   if (!found) return null;
@@ -1237,6 +1258,9 @@ async function runEvidencePlusForEvidenceId(evidenciaId) {
 
 async function rerunEvidencePlusForGroup(visitaId, marcaId, tipoEvidencia, fase) {
   const evidences = await getEvidenciasByVisitId(visitaId);
+  const visit = await getVisitById(visitaId);
+  const reglas = marcaId ? await getReglasPorMarca(marcaId) : [];
+  const header = await getEvidenciasHeader();
   const group = evidences.filter((item) =>
     upper(item.status) !== "ANULADA" &&
     upper(item.tipo_evidencia) !== "ASISTENCIA" &&
@@ -1244,8 +1268,22 @@ async function rerunEvidencePlusForGroup(visitaId, marcaId, tipoEvidencia, fase)
     upper(item.tipo_evidencia) === upper(tipoEvidencia) &&
     upper(item.fase || "NA") === upper(fase || "NA")
   );
+
   for (const item of group) {
-    await runEvidencePlusForEvidenceId(item.evidencia_id);
+    const analysis = computeEvidencePlusAnalysis(item, { visit, sameVisit: evidences, reglas });
+    await updateEvidenceRow(header, item, {
+      resultado_ai: analysis.resultado_ai,
+      score_confianza: String(analysis.score_confianza),
+      riesgo: analysis.riesgo,
+      hallazgos_ai: analysis.hallazgos_ai,
+      reglas_disparadas: analysis.reglas_disparadas,
+      analizado_at: analysis.analizado_at,
+      version_motor_ai: analysis.version_motor_ai,
+      hash_foto: analysis.hash_foto,
+      requiere_revision_supervisor: analysis.requiere_revision_supervisor,
+      status: analysis.status,
+    });
+    await maybeCreateEvidencePlusAlert({ ...item, hash_foto: analysis.hash_foto }, analysis, visit);
   }
 }
 
