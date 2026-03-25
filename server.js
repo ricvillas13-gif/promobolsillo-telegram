@@ -449,6 +449,49 @@ async function resolveActor(externalId) {
   return { role: "cliente", profile: { external_id: externalId, nombre: "Cliente" } };
 }
 
+async function findSessionRow(externalId) {
+  try {
+    const rows = await getSheetValues("SESIONES!A2:C");
+    for (let i = 0; i < rows.length; i += 1) {
+      if (norm(rows[i][0]) === externalId) {
+        let data_json = {};
+        try {
+          data_json = rows[i][2] ? JSON.parse(rows[i][2]) : {};
+        } catch {
+          data_json = {};
+        }
+        return { rowIndex: i + 2, estado_actual: norm(rows[i][1]) || "MENU", data_json };
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function upsertSessionData(externalId, patch = {}) {
+  try {
+    const found = await findSessionRow(externalId);
+    const nextData = { ...(found?.data_json || {}), ...patch };
+    const payload = [externalId, found?.estado_actual || "MENU", JSON.stringify(nextData)];
+    if (!found) {
+      await appendSheetValues("SESIONES!A2:C", [payload]);
+      return true;
+    }
+    await updateSheetValues(`SESIONES!A${found.rowIndex}:C${found.rowIndex}`, [payload]);
+    return true;
+  } catch (error) {
+    console.warn("upsertSessionData error", error?.message || error);
+    return false;
+  }
+}
+
+async function getChatIdByExternalId(externalId) {
+  const found = await findSessionRow(externalId);
+  const raw = found?.data_json?.chat_id;
+  return raw ? String(raw) : "";
+}
+
 async function getTiendaMap() {
   const rows = await getSheetValues("TIENDAS!A2:K");
   const map = {};
@@ -677,12 +720,38 @@ function buildAlertRowFromHeader(header, payload) {
   return row;
 }
 
+async function notifySupervisorAlert(payload) {
+  try {
+    const supervisorExternalId = norm(payload.supervisor_id);
+    if (!supervisorExternalId || !TELEGRAM_API) return false;
+    const chatId = await getChatIdByExternalId(supervisorExternalId);
+    if (!chatId) return false;
+    const tiendaMap = await getTiendaMap();
+    const tiendaNombre = tiendaMap[payload.tienda_id]?.nombre_tienda || payload.tienda_id || "Tienda";
+    const text = [
+      "🚨 *Nueva alerta*",
+      "",
+      `Tipo: *${payload.tipo_alerta || "ALERTA"}*`,
+      `Severidad: *${payload.severidad || "MEDIA"}*`,
+      `Tienda: *${tiendaNombre}*`,
+      payload.descripcion ? `Detalle: ${payload.descripcion}` : "",
+    ].filter(Boolean).join("
+");
+    await sendTelegramText(chatId, text, { inline_keyboard: [[{ text: "Abrir panel", web_app: { url: getMiniAppUrl() } }]] });
+    return true;
+  } catch (error) {
+    console.warn("notifySupervisorAlert error", error?.message || error);
+    return false;
+  }
+}
+
 async function createAlert(payload) {
   try {
     const header = await getAlertsHeader();
     if (!header.length) return false;
     const row = buildAlertRowFromHeader(header, payload);
     await appendSheetValues(`ALERTAS!A2:${headerRangeEnd(header.length)}`, [row]);
+    await notifySupervisorAlert(payload);
     return true;
   } catch (error) {
     console.warn("createAlert error", error?.message || error);
@@ -1418,13 +1487,15 @@ app.post("/telegram/webhook", async (req, res) => {
       if (incoming.chatId && incoming.fromId) {
         await sendTelegramText(
           incoming.chatId,
-          `telegram_id: ${incoming.fromId}\nexternal_id: telegram:${incoming.fromId}`
+          `telegram_id: ${incoming.fromId}
+external_id: telegram:${incoming.fromId}`
         );
       }
       return res.json({ ok: true });
     }
     if (!incoming.chatId || !incoming.fromId) return res.json({ ok: true, ignored: true });
     const externalId = buildExternalIdFromTelegramUser(incoming.fromId);
+    await upsertSessionData(externalId, { chat_id: String(incoming.chatId || ""), last_seen_at: nowISO() });
     const actor = await resolveActor(externalId);
 
     let payload = null;
