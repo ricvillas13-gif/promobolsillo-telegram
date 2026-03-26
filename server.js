@@ -25,6 +25,7 @@ const EVPLUS_VERSION = "EVPLUS_V1";
 const EVPLUS_MIN_DIMENSION = 420;
 const EVPLUS_MIN_ESTIMATED_BYTES = 9000;
 const PHOTO_CELL_LIMIT = 48000;
+const pendingEvidenceAnalysisTimers = new Map();
 
 const ALLOWED_ORIGINS = [MINIAPP_BASE_URL, PUBLIC_BASE_URL, "http://localhost:5173", "https://localhost:5173"].filter(Boolean);
 
@@ -291,6 +292,33 @@ function canonicalEvidenceTypeLabel(value) {
 
 function evidenceTypeKey(value) {
   return normalizeTextKey(canonicalEvidenceTypeLabel(value));
+}
+
+function buildEvidenceGroupKey(visitaId, marcaId, tipoEvidencia, fase) {
+  return [
+    norm(visitaId),
+    norm(marcaId),
+    evidenceTypeKey(tipoEvidencia),
+    upper(fase || "NA"),
+  ].join("::");
+}
+
+function scheduleEvidenceGroupAnalysis({ visitaId, marcaId, tipoEvidencia, fase }) {
+  const key = buildEvidenceGroupKey(visitaId, marcaId, tipoEvidencia, fase);
+  const existing = pendingEvidenceAnalysisTimers.get(key);
+  if (existing) clearTimeout(existing);
+  const timer = setTimeout(async () => {
+    pendingEvidenceAnalysisTimers.delete(key);
+    try {
+      scheduleEvidenceGroupAnalysis({ visitaId, marcaId, tipoEvidencia, fase });
+    } catch (error) {
+      console.warn("scheduleEvidenceGroupAnalysis error", {
+        key,
+        message: error?.message || error,
+      });
+    }
+  }, 2500);
+  pendingEvidenceAnalysisTimers.set(key, timer);
 }
 
 function verifyTelegramInitData(initData) {
@@ -1991,6 +2019,7 @@ app.post("/miniapp/promotor/evidence-register", async (req, res) => {
       created,
       count: created.length,
       warning: batchResult.photoOverflow ? "evidence_photo_too_large_for_sheets" : undefined,
+      analysis_status: "scheduled",
     });
   } catch (error) {
     console.error("evidence-register error", error);
@@ -2012,7 +2041,12 @@ app.post("/miniapp/promotor/cancel-evidence", async (req, res) => {
       note: note ? `${found.evidence.note ? `${found.evidence.note} | ` : ""}${note}` : found.evidence.note,
     });
     if (upper(found.evidence.tipo_evidencia) !== "ASISTENCIA") {
-      await rerunEvidencePlusForGroup(found.evidence.visita_id, found.evidence.marca_id, found.evidence.tipo_evidencia, found.evidence.fase || "NA");
+      scheduleEvidenceGroupAnalysis({
+        visitaId: found.evidence.visita_id,
+        marcaId: found.evidence.marca_id,
+        tipoEvidencia: found.evidence.tipo_evidencia,
+        fase: found.evidence.fase || "NA",
+      });
     }
     return res.json({ ok: true, evidencia_id: evidenciaId, status: "ANULADA" });
   } catch (error) {
@@ -2044,8 +2078,12 @@ app.post("/miniapp/promotor/replace-evidence", async (req, res) => {
       requiere_revision_supervisor: "FALSE",
     });
     if (upper(found.evidence.tipo_evidencia) !== "ASISTENCIA") {
-      await runEvidencePlusForEvidenceId(evidenciaId);
-      await rerunEvidencePlusForGroup(found.evidence.visita_id, found.evidence.marca_id, found.evidence.tipo_evidencia, found.evidence.fase || "NA");
+      scheduleEvidenceGroupAnalysis({
+        visitaId: found.evidence.visita_id,
+        marcaId: found.evidence.marca_id,
+        tipoEvidencia: found.evidence.tipo_evidencia,
+        fase: found.evidence.fase || "NA",
+      });
     }
     return res.json({ ok: true, evidencia_id: evidenciaId, replaced: true, warning: result.photoOverflow ? "evidence_photo_too_large_for_sheets" : undefined });
   } catch (error) {
