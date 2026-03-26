@@ -942,13 +942,21 @@ async function resolveMarcaIdByName(marcaNombre) {
 async function getTiposEvidenciaCatalog() {
   try {
     const rows = await getSheetValues("TIPOS_EVIDENCIA!A2:C");
-    return rows
-      .filter((row) => norm(row[0]))
-      .map((row) => ({
-        tipo_evidencia: norm(row[0]),
+    const seen = new Set();
+    const items = [];
+    for (const row of rows) {
+      const tipo = norm(row[0]);
+      if (!tipo) continue;
+      const key = upper(tipo);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      items.push({
+        tipo_evidencia: tipo,
         descripcion_corta: norm(row[1]),
         fotos_requeridas: safeInt(row[2], 1),
-      }));
+      });
+    }
+    return items;
   } catch {
     return [];
   }
@@ -1654,8 +1662,25 @@ app.post("/miniapp/promotor/evidence-rules", async (req, res) => {
     let marcaId = norm(req.body?.marca_id);
     const marcaNombre = norm(req.body?.marca_nombre);
     if (!marcaId && marcaNombre) marcaId = await resolveMarcaIdByName(marcaNombre);
-    if (!marcaId) return res.json({ ok: true, reglas: await getTiposEvidenciaCatalog() });
-    const reglas = await getReglasPorMarca(marcaId);
+
+    const dedupeRules = (rules) => {
+      const seen = new Set();
+      const out = [];
+      for (const rule of rules || []) {
+        const tipo = norm(rule?.tipo_evidencia);
+        if (!tipo) continue;
+        const key = upper(tipo);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push({ ...rule, tipo_evidencia: tipo });
+      }
+      return out;
+    };
+
+    if (!marcaId) {
+      return res.json({ ok: true, reglas: dedupeRules(await getTiposEvidenciaCatalog()) });
+    }
+    const reglas = dedupeRules(await getReglasPorMarca(marcaId));
     return res.json({ ok: true, reglas });
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message || "evidence rules error" });
