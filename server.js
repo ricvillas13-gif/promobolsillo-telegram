@@ -268,6 +268,31 @@ function buildEvidencePhotoHash(photoValue, photoName = "") {
   return crypto.createHash("sha256").update(digestInput).digest("hex");
 }
 
+function normalizeTextKey(value) {
+  return norm(value)
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toUpperCase();
+}
+
+function canonicalEvidenceTypeLabel(value) {
+  const raw = norm(value);
+  if (!raw) return "";
+  const key = normalizeTextKey(raw);
+  if (key.includes("ANAQUEL") && key.includes("ACERCAMIENTO") && key.includes("PRECIO")) {
+    return "Anaquel/acercamiento/inventario/precios";
+  }
+  if (key === "COMPETENCIA") return "Competencia";
+  if (key === "FACHADA TIENDA") return "Fachada tienda";
+  return raw;
+}
+
+function evidenceTypeKey(value) {
+  return normalizeTextKey(canonicalEvidenceTypeLabel(value));
+}
+
 function verifyTelegramInitData(initData) {
   if (!TELEGRAM_BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN no configurado para validar initData");
   const params = new URLSearchParams(initData);
@@ -870,7 +895,7 @@ function parseEvidenceRow(row, idx, header) {
     riesgo: upper(row[map.riesgo] || "BAJO"),
     marca_id: norm(row[map.marca_id]),
     producto_id: norm(row[map.producto_id]),
-    tipo_evidencia: norm(row[map.tipo_evidencia]),
+    tipo_evidencia: canonicalEvidenceTypeLabel(row[map.tipo_evidencia]),
     descripcion: norm(row[map.descripcion]),
     status: upper(row[map.status] || "ACTIVA"),
     note: norm(row[map.note]),
@@ -926,50 +951,68 @@ async function getEvidenciasByVisitId(visitaId) {
 }
 
 async function registrarEvidencia(payload) {
+  const result = await registrarEvidenciasBatch([payload]);
+  return { photoOverflow: result.photoOverflow, originalPhotoLength: result.maxOriginalPhotoLength || 0 };
+}
+
+async function registrarEvidenciasBatch(payloads = []) {
+  if (!Array.isArray(payloads) || !payloads.length) {
+    return { photoOverflow: false, maxOriginalPhotoLength: 0 };
+  }
   const header = await getEvidenciasHeader();
-  const photoInfo = normalizePhotoForSheet(payload.url_foto);
-  const safeNote = mergeOverflowNote(payload.note || "", photoInfo);
-  const rowPayload = {
-    evidencia_id: fitCell(payload.evidencia_id),
-    external_id: fitCell(payload.external_id || ""),
-    fecha_hora: fitCell(payload.fecha_hora || nowISO()),
-    tipo_evento: fitCell(payload.tipo_evento || ""),
-    origen: fitCell(payload.origen || ""),
-    jornada_id: fitCell(payload.jornada_id || ""),
-    visita_id: fitCell(payload.visita_id || ""),
-    url_foto: photoInfo.value,
-    lat: fitCell(payload.lat || ""),
-    lon: fitCell(payload.lon || ""),
-    resultado_ai: fitCell(payload.resultado_ai || ""),
-    score_confianza: fitCell(payload.score_confianza || ""),
-    riesgo: fitCell(payload.riesgo || "BAJO"),
-    marca_id: fitCell(payload.marca_id || ""),
-    producto_id: fitCell(payload.producto_id || ""),
-    tipo_evidencia: fitCell(payload.tipo_evidencia || ""),
-    descripcion: fitCell(payload.descripcion || ""),
-    status: fitCell(payload.status || "ACTIVA"),
-    note: safeNote,
-    fase: fitCell(payload.fase || ""),
-    foto_nombre: fitCell(payload.foto_nombre || ""),
-    accuracy: fitCell(payload.accuracy || ""),
-    requiere_revision_supervisor: fitCell(payload.requiere_revision_supervisor || "FALSE"),
-    revisado_por: fitCell(payload.revisado_por || ""),
-    fecha_revision: fitCell(payload.fecha_revision || ""),
-    decision_supervisor: fitCell(payload.decision_supervisor || ""),
-    motivo_revision: fitCell(payload.motivo_revision || ""),
-    hallazgos_ai: fitCell(payload.hallazgos_ai || ""),
-    reglas_disparadas: fitCell(payload.reglas_disparadas || ""),
-    analizado_at: fitCell(payload.analizado_at || ""),
-    version_motor_ai: fitCell(payload.version_motor_ai || ""),
-    hash_foto: fitCell(payload.hash_foto || ""),
-  };
-  const row = buildEvidenceRowFromHeader(header, rowPayload);
-  await appendSheetValues(`EVIDENCIAS!A2:${headerRangeEnd(header.length)}`, [row]);
-  return { photoOverflow: photoInfo.overflow, originalPhotoLength: photoInfo.originalLength };
+  const rows = [];
+  let photoOverflow = false;
+  let maxOriginalPhotoLength = 0;
+
+  for (const payload of payloads) {
+    const photoInfo = normalizePhotoForSheet(payload.url_foto);
+    const safeNote = mergeOverflowNote(payload.note || "", photoInfo);
+    photoOverflow = photoOverflow || photoInfo.overflow;
+    maxOriginalPhotoLength = Math.max(maxOriginalPhotoLength, photoInfo.originalLength || 0);
+    const rowPayload = {
+      evidencia_id: fitCell(payload.evidencia_id),
+      external_id: fitCell(payload.external_id || ""),
+      fecha_hora: fitCell(payload.fecha_hora || nowISO()),
+      tipo_evento: fitCell(payload.tipo_evento || ""),
+      origen: fitCell(payload.origen || ""),
+      jornada_id: fitCell(payload.jornada_id || ""),
+      visita_id: fitCell(payload.visita_id || ""),
+      url_foto: photoInfo.value,
+      lat: fitCell(payload.lat || ""),
+      lon: fitCell(payload.lon || ""),
+      resultado_ai: fitCell(payload.resultado_ai || ""),
+      score_confianza: fitCell(payload.score_confianza || ""),
+      riesgo: fitCell(payload.riesgo || "BAJO"),
+      marca_id: fitCell(payload.marca_id || ""),
+      producto_id: fitCell(payload.producto_id || ""),
+      tipo_evidencia: fitCell(canonicalEvidenceTypeLabel(payload.tipo_evidencia || "")),
+      descripcion: fitCell(payload.descripcion || ""),
+      status: fitCell(payload.status || "ACTIVA"),
+      note: safeNote,
+      fase: fitCell(payload.fase || ""),
+      foto_nombre: fitCell(payload.foto_nombre || ""),
+      accuracy: fitCell(payload.accuracy || ""),
+      requiere_revision_supervisor: fitCell(payload.requiere_revision_supervisor || "FALSE"),
+      revisado_por: fitCell(payload.revisado_por || ""),
+      fecha_revision: fitCell(payload.fecha_revision || ""),
+      decision_supervisor: fitCell(payload.decision_supervisor || ""),
+      motivo_revision: fitCell(payload.motivo_revision || ""),
+      hallazgos_ai: fitCell(payload.hallazgos_ai || ""),
+      reglas_disparadas: fitCell(payload.reglas_disparadas || ""),
+      analizado_at: fitCell(payload.analizado_at || ""),
+      version_motor_ai: fitCell(payload.version_motor_ai || ""),
+      hash_foto: fitCell(payload.hash_foto || ""),
+    };
+    rows.push(buildEvidenceRowFromHeader(header, rowPayload));
+  }
+
+  await appendSheetValues(`EVIDENCIAS!A2:${headerRangeEnd(header.length)}`, rows);
+  return { photoOverflow, maxOriginalPhotoLength };
 }
 
 async function updateEvidenceRow(header, evidence, patch = {}) {
   const next = { ...evidence, ...patch };
+  next.tipo_evidencia = canonicalEvidenceTypeLabel(next.tipo_evidencia);
   const photoInfo = normalizePhotoForSheet(next.url_foto ?? evidence.url_foto);
   next.url_foto = photoInfo.value;
   next.note = mergeOverflowNote(next.note ?? evidence.note, photoInfo);
@@ -1013,9 +1056,9 @@ async function getTiposEvidenciaCatalog() {
     const seen = new Set();
     const items = [];
     for (const row of rows) {
-      const tipo = norm(row[0]);
+      const tipo = canonicalEvidenceTypeLabel(row[0]);
       if (!tipo) continue;
-      const key = upper(tipo);
+      const key = evidenceTypeKey(tipo);
       if (seen.has(key)) continue;
       seen.add(key);
       items.push({
@@ -1038,7 +1081,7 @@ async function getReglasPorMarca(marcaId) {
       .filter((row) => norm(row[0]) === marcaId && (row.length < 5 || isTrue(row[4] ?? "TRUE")))
       .map((row) => ({
         marca_id: marcaId,
-        tipo_evidencia: norm(row[1]),
+        tipo_evidencia: canonicalEvidenceTypeLabel(row[1]),
         fotos_requeridas: safeInt(row[2], 1),
         requiere_antes_despues: isTrue(row[3]),
         origen: "REGLAS_EVIDENCIA",
@@ -1051,12 +1094,12 @@ async function getReglasPorMarca(marcaId) {
   const byType = new Map();
 
   const pushUniqueRule = (rule) => {
-    const key = upper(rule.tipo_evidencia);
+    const key = evidenceTypeKey(rule.tipo_evidencia);
     if (!key) return;
     if (byType.has(key)) {
       const existing = byType.get(key);
       if (existing.origen === "TIPOS_EVIDENCIA" && rule.origen === "REGLAS_EVIDENCIA") {
-        const idx = merged.findIndex((item) => upper(item.tipo_evidencia) === key);
+        const idx = merged.findIndex((item) => evidenceTypeKey(item.tipo_evidencia) === key);
         if (idx >= 0) merged[idx] = rule;
         byType.set(key, rule);
       }
@@ -1070,7 +1113,7 @@ async function getReglasPorMarca(marcaId) {
   catalog.forEach((item) => {
     pushUniqueRule({
       marca_id: marcaId,
-      tipo_evidencia: item.tipo_evidencia,
+      tipo_evidencia: canonicalEvidenceTypeLabel(item.tipo_evidencia),
       fotos_requeridas: item.fotos_requeridas || 1,
       requiere_antes_despues: false,
       descripcion_corta: item.descripcion_corta,
@@ -1139,10 +1182,10 @@ function computeEvidencePlusAnalysis(evidence, context = {}) {
   const activeSameVisit = sameVisit.filter((item) => upper(item.status) !== "ANULADA");
   const activeSameGroup = activeSameVisit.filter((item) =>
     upper(item.marca_id) === upper(evidence.marca_id) &&
-    upper(item.tipo_evidencia) === upper(evidence.tipo_evidencia) &&
+    evidenceTypeKey(item.tipo_evidencia) === evidenceTypeKey(evidence.tipo_evidencia) &&
     upper(item.fase || "NA") === upper(evidence.fase || "NA")
   );
-  const regla = reglas.find((rule) => upper(rule.tipo_evidencia) === upper(evidence.tipo_evidencia));
+  const regla = reglas.find((rule) => evidenceTypeKey(rule.tipo_evidencia) === evidenceTypeKey(evidence.tipo_evidencia));
   const expectedPhotos = safeInt(regla?.fotos_requeridas, 1);
   const requiereFase = Boolean(regla?.requiere_antes_despues);
   const hash = buildEvidencePhotoHash(evidence.url_foto, evidence.foto_nombre);
@@ -1187,7 +1230,7 @@ function computeEvidencePlusAnalysis(evidence, context = {}) {
       const hasAntes = activeSameVisit.some((item) =>
         item.evidencia_id !== evidence.evidencia_id &&
         upper(item.marca_id) === upper(evidence.marca_id) &&
-        upper(item.tipo_evidencia) === upper(evidence.tipo_evidencia) &&
+        evidenceTypeKey(item.tipo_evidencia) === evidenceTypeKey(evidence.tipo_evidencia) &&
         upper(item.fase) === "ANTES" &&
         upper(item.status) !== "ANULADA"
       );
@@ -1341,7 +1384,7 @@ async function rerunEvidencePlusForGroup(visitaId, marcaId, tipoEvidencia, fase)
     upper(item.status) !== "ANULADA" &&
     upper(item.tipo_evidencia) !== "ASISTENCIA" &&
     upper(item.marca_id) === upper(marcaId) &&
-    upper(item.tipo_evidencia) === upper(tipoEvidencia) &&
+    evidenceTypeKey(item.tipo_evidencia) === evidenceTypeKey(tipoEvidencia) &&
     upper(item.fase || "NA") === upper(fase || "NA")
   );
 
@@ -1735,12 +1778,12 @@ app.post("/miniapp/promotor/evidence-rules", async (req, res) => {
       const seen = new Set();
       const out = [];
       for (const rule of rules || []) {
-        const tipo = norm(rule?.tipo_evidencia);
+        const tipo = canonicalEvidenceTypeLabel(rule?.tipo_evidencia);
         if (!tipo) continue;
-        const key = upper(tipo);
+        const key = evidenceTypeKey(tipo);
         if (seen.has(key)) continue;
         seen.add(key);
-        out.push({ ...rule, tipo_evidencia: tipo });
+        out.push({ ...rule, tipo_evidencia: canonicalEvidenceTypeLabel(tipo) });
       }
       return out;
     };
@@ -1886,7 +1929,7 @@ app.post("/miniapp/promotor/evidence-register", async (req, res) => {
     const visitaId = norm(req.body?.visita_id);
     const marcaIdRaw = norm(req.body?.marca_id);
     const marcaNombreRaw = norm(req.body?.marca_nombre);
-    const tipoEvidencia = norm(req.body?.tipo_evidencia);
+    const tipoEvidencia = canonicalEvidenceTypeLabel(req.body?.tipo_evidencia);
     const fase = norm(req.body?.fase || "NA") || "NA";
     const descripcion = norm(req.body?.descripcion);
     const fotos = Array.isArray(req.body?.fotos) ? req.body.fotos : [];
@@ -1897,13 +1940,12 @@ app.post("/miniapp/promotor/evidence-register", async (req, res) => {
 
     const marcaId = marcaIdRaw || (await resolveMarcaIdByName(marcaNombreRaw));
     const created = [];
-    let anyOverflow = false;
-
-    for (const photo of fotos) {
+    const batchPayloads = fotos.map((photo) => {
       const evidenceId = `EV-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      created.push(evidenceId);
       const photoName = fitCell(norm(photo?.name || "evidencia.jpg"));
       const photoValue = norm(photo?.dataUrl || photo?.url || "");
-      const result = await registrarEvidencia({
+      return {
         evidencia_id: evidenceId,
         external_id: actor.profile.external_id,
         fecha_hora: nowISO(),
@@ -1936,10 +1978,10 @@ app.post("/miniapp/promotor/evidence-register", async (req, res) => {
         analizado_at: "",
         version_motor_ai: "",
         hash_foto: buildEvidencePhotoHash(photoValue, photoName),
-      });
-      anyOverflow = anyOverflow || result.photoOverflow;
-      created.push(evidenceId);
-    }
+      };
+    });
+
+    const batchResult = await registrarEvidenciasBatch(batchPayloads);
 
     await rerunEvidencePlusForGroup(visitaId, marcaId, tipoEvidencia, fase);
 
@@ -1948,7 +1990,7 @@ app.post("/miniapp/promotor/evidence-register", async (req, res) => {
       visita_id: visitaId,
       created,
       count: created.length,
-      warning: anyOverflow ? "evidence_photo_too_large_for_sheets" : undefined,
+      warning: batchResult.photoOverflow ? "evidence_photo_too_large_for_sheets" : undefined,
     });
   } catch (error) {
     console.error("evidence-register error", error);
@@ -2172,7 +2214,7 @@ app.post("/miniapp/supervisor/evidences", async (req, res) => {
     if (promotorFilter) evidences = evidences.filter((item) => visitMap[item.visita_id]?.promotor_id === promotorFilter);
     if (tiendaFilter) evidences = evidences.filter((item) => visitMap[item.visita_id]?.tienda_id === tiendaFilter || tiendaMap[visitMap[item.visita_id]?.tienda_id]?.nombre_tienda === tiendaFilter);
     if (marcaFilter) evidences = evidences.filter((item) => item.marca_id === marcaFilter || marcaMap[item.marca_id]?.marca_nombre === marcaFilter);
-    if (tipoFilter) evidences = evidences.filter((item) => item.tipo_evidencia === tipoFilter);
+    if (tipoFilter) evidences = evidences.filter((item) => evidenceTypeKey(item.tipo_evidencia) === evidenceTypeKey(tipoFilter));
     if (riesgoFilter) evidences = evidences.filter((item) => upper(item.riesgo) === riesgoFilter);
     evidences.sort((a, b) => String(b.fecha_hora).localeCompare(String(a.fecha_hora)));
     const visible = evidences.map((item) => buildEvidenceView(item, marcaMap, visitMap, tiendaMap, promotorMap));
