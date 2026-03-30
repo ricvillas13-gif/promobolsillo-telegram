@@ -310,7 +310,7 @@ function scheduleEvidenceGroupAnalysis({ visitaId, marcaId, tipoEvidencia, fase 
   const timer = setTimeout(async () => {
     pendingEvidenceAnalysisTimers.delete(key);
     try {
-      scheduleEvidenceGroupAnalysis({ visitaId, marcaId, tipoEvidencia, fase });
+      await rerunEvidencePlusForGroup(visitaId, marcaId, tipoEvidencia, fase);
     } catch (error) {
       console.warn("scheduleEvidenceGroupAnalysis error", {
         key,
@@ -1050,20 +1050,20 @@ async function updateEvidenceRow(header, evidence, patch = {}) {
 }
 
 async function getMarcasActivas() {
-  const rows = await getSheetValues("MARCAS!A2:C");
+  const rows = await getSheetValues("MARCAS!A2:D");
   return rows
     .filter((row) => norm(row[0]) && (row.length < 3 || isTrue(row[2])))
-    .map((row) => ({ marca_id: norm(row[0]), marca_nombre: norm(row[1]) }))
+    .map((row) => ({ marca_id: norm(row[0]), marca_nombre: norm(row[1]), cliente_id: norm(row[3]) }))
     .sort((a, b) => a.marca_nombre.localeCompare(b.marca_nombre));
 }
 
 async function getMarcaMap() {
-  const rows = await getSheetValues("MARCAS!A2:C");
+  const rows = await getSheetValues("MARCAS!A2:D");
   const map = {};
   rows.forEach((row) => {
     const id = norm(row[0]);
     if (!id) return;
-    map[id] = { marca_id: id, marca_nombre: norm(row[1]), activa: row.length < 3 || isTrue(row[2]) };
+    map[id] = { marca_id: id, marca_nombre: norm(row[1]), activa: row.length < 3 || isTrue(row[2]), cliente_id: norm(row[3]) };
   });
   return map;
 }
@@ -1071,7 +1071,7 @@ async function getMarcaMap() {
 async function resolveMarcaIdByName(marcaNombre) {
   const target = upper(marcaNombre);
   if (!target) return "";
-  const rows = await getSheetValues("MARCAS!A2:C");
+  const rows = await getSheetValues("MARCAS!A2:D");
   for (const row of rows) {
     if (upper(row[1]) === target) return norm(row[0]);
   }
@@ -1648,6 +1648,307 @@ async function respondSupervisorShortcut(actor, key) {
   }
   return buildSupervisorMenu(actor);
 }
+
+
+function parseClientDateFilters(filters = {}) {
+  const start = norm(filters.fecha_inicio) || `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, "0")}-01`;
+  const end = norm(filters.fecha_fin) || todayISO();
+  return { fecha_inicio: start, fecha_fin: end };
+}
+
+function inRangeYmd(isoLike, startYmd, endYmd) {
+  if (!isoLike) return false;
+  const ymd = /^\d{4}-\d{2}-\d{2}$/.test(String(isoLike)) ? String(isoLike) : ymdInTZ(new Date(isoLike), APP_TZ);
+  return ymd >= startYmd && ymd <= endYmd;
+}
+
+function clientOk(res, data, meta = {}) {
+  return res.json({ ok: true, data, meta, error: null });
+}
+
+function clientFail(res, status, message) {
+  return res.status(status).json({ ok: false, data: null, meta: {}, error: message });
+}
+
+async function getClientScopeFromRequest(req) {
+  const { validated } = await getActorFromRequest(req);
+  const ctx = await getClienteContextByExternalId(validated.external_id);
+  if (!ctx) throw new Error("Solo cliente");
+  return ctx;
+}
+
+async function getClientBrandIds(clienteId) {
+  const marcaMap = await getMarcaMap();
+  return Object.values(marcaMap)
+    .filter((item) => item.cliente_id === clienteId && item.activa !== false)
+    .map((item) => item.marca_id);
+}
+
+async function getClientDataset(clienteId, filters = {}) {
+  const { fecha_inicio, fecha_fin } = parseClientDateFilters(filters);
+  const cadena = norm(filters.cadena);
+  const region = norm(filters.region);
+  const tiendaId = norm(filters.tienda_id);
+  const marcaId = norm(filters.marca_id);
+
+  const clientBrandIds = new Set(await getClientBrandIds(clienteId));
+  const visitMap = await getAllVisitsMap();
+  const marcaMap = await getMarcaMap();
+  const tiendaMap = await getTiendaMap();
+  const promotorMap = await getPromotorMap();
+
+  let evidences = (await getEvidenciasAll()).filter((item) =>
+    upper(item.tipo_evidencia) !== "ASISTENCIA" &&
+    clientBrandIds.has(item.marca_id) &&
+    inRangeYmd(item.fecha_hora, fecha_inicio, fecha_fin)
+  );
+  if (marcaId) evidences = evidences.filter((item) => item.marca_id === marcaId);
+
+  let visits = Object.values(visitMap).filter((visit) =>
+    evidences.some((e) => e.visita_id === visit.visita_id)
+  );
+
+  let stores = unique(visits.map((visit) => visit.tienda_id)).map((id) => tiendaMap[id]).filter(Boolean);
+  if (cadena) stores = stores.filter((store) => norm(store.cadena) === cadena);
+  if (region) stores = stores.filter((store) => norm(store.region) === region);
+  if (tiendaId) stores = stores.filter((store) => norm(store.tienda_id) === tiendaId);
+  const scopedStoreIds = new Set(stores.map((store) => store.tienda_id));
+  visits = visits.filter((visit) => scopedStoreIds.has(visit.tienda_id));
+  const scopedVisitIds = new Set(visits.map((visit) => visit.visita_id));
+  evidences = evidences.filter((item) => scopedVisitIds.has(item.visita_id));
+  const scopedEvidenceIds = new Set(evidences.map((item) => item.evidencia_id));
+
+  const alerts = (await getAlertsAll()).filter((alert) =>
+    inRangeYmd(alert.fecha_hora, fecha_inicio, fecha_fin) &&
+    ((alert.evidencia_id && scopedEvidenceIds.has(alert.evidencia_id)) || (alert.visita_id && scopedVisitIds.has(alert.visita_id)))
+  );
+
+  return {
+    fecha_inicio,
+    fecha_fin,
+    brandIds: Array.from(clientBrandIds),
+    stores,
+    visits,
+    evidences,
+    alerts,
+    visitMap,
+    promotorMap,
+    marcaMap,
+    tiendaMap,
+  };
+}
+
+function paginateRows(rows, pagination = {}) {
+  const page = Math.max(1, safeInt(pagination.page, 1));
+  const pageSize = Math.max(1, safeInt(pagination.page_size, 25));
+  const totalRows = rows.length;
+  const totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
+  const start = (page - 1) * pageSize;
+  return {
+    rows: rows.slice(start, start + pageSize),
+    meta: { page, page_size: pageSize, total_rows: totalRows, total_pages: totalPages },
+  };
+}
+
+app.post("/miniapp/cliente/bootstrap", async (req, res) => {
+  try {
+    const ctx = await getClientScopeFromRequest(req);
+    return clientOk(res, {
+      role: "cliente",
+      cliente: ctx.cliente,
+      access: ctx.access,
+    });
+  } catch (error) {
+    return clientFail(res, error.message === "Solo cliente" ? 403 : 401, error.message || "auth failed");
+  }
+});
+
+app.post("/miniapp/cliente/filter-options", async (req, res) => {
+  try {
+    const ctx = await getClientScopeFromRequest(req);
+    const data = await getClientDataset(ctx.cliente.cliente_id, req.body || {});
+    const marcas = Array.from(new Set(data.evidences.map((item) => item.marca_id).filter(Boolean))).map((id) => ({
+      id,
+      label: data.marcaMap[id]?.marca_nombre || id,
+    }));
+    const tipos = Array.from(new Set(data.evidences.map((item) => item.tipo_evidencia).filter(Boolean))).sort();
+    return clientOk(res, {
+      cadenas: Array.from(new Set(data.stores.map((item) => item.cadena).filter(Boolean))).map((x) => ({ id: x, label: x })),
+      regiones: Array.from(new Set(data.stores.map((item) => item.region).filter(Boolean))).map((x) => ({ id: x, label: x })),
+      tiendas: data.stores.map((item) => ({ id: item.tienda_id, label: item.nombre_tienda || item.tienda_id })),
+      marcas,
+      tipos_evidencia: tipos.map((x) => ({ id: x, label: x })),
+      riesgos: ["BAJO", "MEDIO", "ALTO"].map((x) => ({ id: x, label: x })),
+      decisiones: ["APROBADA", "OBSERVADA", "RECHAZADA"].map((x) => ({ id: x, label: x })),
+      severidades: ["ALTA", "MEDIA", "BAJA"].map((x) => ({ id: x, label: x })),
+      estatus_alerta: ["ABIERTA", "RESUELTA", "DESCARTADA"].map((x) => ({ id: x, label: x })),
+    });
+  } catch (error) {
+    return clientFail(res, error.message === "Solo cliente" ? 403 : 500, error.message || "cliente filter-options error");
+  }
+});
+
+app.post("/miniapp/cliente/dashboard", async (req, res) => {
+  try {
+    const ctx = await getClientScopeFromRequest(req);
+    const filters = req.body?.filters || req.body || {};
+    const data = await getClientDataset(ctx.cliente.cliente_id, filters);
+    const uniqueStores = new Set(data.visits.map((visit) => visit.tienda_id));
+    const aprobadas = data.evidences.filter((item) => upper(item.decision_supervisor || item.status) === "APROBADA").length;
+    const observadas = data.evidences.filter((item) => upper(item.decision_supervisor || item.status) === "OBSERVADA").length;
+    const rechazadas = data.evidences.filter((item) => upper(item.decision_supervisor || item.status) === "RECHAZADA").length;
+    const geocercaOk = data.visits.filter((visit) =>
+      ["OK_EN_GEOCERCA", "OK_CON_TOLERANCIA_GPS"].includes(upper(visit.resultado_geocerca_entrada)) ||
+      ["OK_EN_GEOCERCA", "OK_CON_TOLERANCIA_GPS"].includes(upper(visit.resultado_geocerca_salida))
+    ).length;
+    const cumplimiento = data.stores.length ? Number(((uniqueStores.size / data.stores.length) * 100).toFixed(2)) : 0;
+    return clientOk(res, {
+      period: { fecha_inicio: data.fecha_inicio, fecha_fin: data.fecha_fin, label: `${data.fecha_inicio} a ${data.fecha_fin}` },
+      cliente: ctx.cliente,
+      kpis: {
+        tiendas_visibles: data.stores.length,
+        tiendas_visitadas: uniqueStores.size,
+        visitas: data.visits.length,
+        cumplimiento_pct: cumplimiento,
+        evidencias: data.evidences.length,
+        aprobadas,
+        observadas,
+        rechazadas,
+        alertas: data.alerts.length,
+        geocerca_ok_pct: data.visits.length ? Number(((geocercaOk / data.visits.length) * 100).toFixed(2)) : 0,
+      },
+      top_alerts: Array.from(data.alerts.reduce((acc, item) => {
+        acc.set(item.tipo_alerta, (acc.get(item.tipo_alerta) || 0) + 1);
+        return acc;
+      }, new Map()).entries()).map(([tipo_alerta, total]) => ({ tipo_alerta, total })).sort((a, b) => b.total - a.total).slice(0, 6),
+    });
+  } catch (error) {
+    return clientFail(res, error.message === "Solo cliente" ? 403 : 500, error.message || "cliente dashboard error");
+  }
+});
+
+app.post("/miniapp/cliente/stores", async (req, res) => {
+  try {
+    const ctx = await getClientScopeFromRequest(req);
+    const filters = req.body?.filters || req.body || {};
+    const data = await getClientDataset(ctx.cliente.cliente_id, filters);
+    const rows = data.stores.map((store) => {
+      const visits = data.visits.filter((visit) => visit.tienda_id === store.tienda_id);
+      const evidences = data.evidences.filter((item) => data.visitMap[item.visita_id]?.tienda_id === store.tienda_id);
+      const alerts = data.alerts.filter((item) => data.visitMap[item.visita_id]?.tienda_id === store.tienda_id);
+      const lastVisit = visits.slice().sort((a, b) => String(b.hora_inicio || b.fecha).localeCompare(String(a.hora_inicio || a.fecha)))[0] || null;
+      return {
+        tienda_id: store.tienda_id,
+        tienda_nombre: store.nombre_tienda || store.tienda_id,
+        cadena: store.cadena || "",
+        region: store.region || "",
+        ciudad: store.ciudad || "",
+        visitas: visits.length,
+        ultima_visita: lastVisit?.hora_inicio || lastVisit?.fecha || "",
+        ultima_visita_fmt: lastVisit?.hora_inicio ? fmtDateTimeTZ(lastVisit.hora_inicio) : lastVisit?.fecha || "-",
+        evidencias: evidences.length,
+        aprobadas: evidences.filter((item) => upper(item.decision_supervisor || item.status) === "APROBADA").length,
+        observadas: evidences.filter((item) => upper(item.decision_supervisor || item.status) === "OBSERVADA").length,
+        alertas: alerts.length,
+        estatus: alerts.length ? "CON_INCIDENCIAS" : visits.length ? "CON_VISITA" : "SIN_VISITA",
+      };
+    }).sort((a, b) => a.tienda_nombre.localeCompare(b.tienda_nombre));
+    const paged = paginateRows(rows, req.body?.pagination || {});
+    return clientOk(res, { rows: paged.rows }, paged.meta);
+  } catch (error) {
+    return clientFail(res, error.message === "Solo cliente" ? 403 : 500, error.message || "cliente stores error");
+  }
+});
+
+app.post("/miniapp/cliente/store-detail", async (req, res) => {
+  try {
+    const ctx = await getClientScopeFromRequest(req);
+    const tiendaId = norm(req.body?.tienda_id);
+    const filters = req.body?.filters || req.body || {};
+    const data = await getClientDataset(ctx.cliente.cliente_id, { ...filters, tienda_id: tiendaId });
+    const store = data.stores.find((item) => item.tienda_id === tiendaId);
+    if (!store) return clientFail(res, 404, "Tienda no encontrada");
+    const visits = data.visits.filter((visit) => visit.tienda_id === tiendaId);
+    const evidences = data.evidences.filter((item) => data.visitMap[item.visita_id]?.tienda_id === tiendaId).map((item) => buildEvidenceView(item, data.marcaMap, data.visitMap, data.tiendaMap, data.promotorMap));
+    const alerts = data.alerts.filter((item) => data.visitMap[item.visita_id]?.tienda_id === tiendaId).map((item) => ({
+      ...item,
+      fecha_hora_fmt: fmtDateTimeTZ(item.fecha_hora),
+      promotor_nombre: data.promotorMap[item.promotor_id]?.nombre || item.promotor_id,
+    }));
+    return clientOk(res, {
+      store,
+      summary: {
+        visitas: visits.length,
+        evidencias: evidences.length,
+        aprobadas: evidences.filter((item) => upper(item.decision_supervisor || item.status) === "APROBADA").length,
+        observadas: evidences.filter((item) => upper(item.decision_supervisor || item.status) === "OBSERVADA").length,
+        alertas: alerts.length,
+      },
+      visits,
+      evidences: evidences.slice(0, 60),
+      alerts,
+    });
+  } catch (error) {
+    return clientFail(res, error.message === "Solo cliente" ? 403 : 500, error.message || "cliente store-detail error");
+  }
+});
+
+app.post("/miniapp/cliente/evidences", async (req, res) => {
+  try {
+    const ctx = await getClientScopeFromRequest(req);
+    const filters = req.body?.filters || req.body || {};
+    const data = await getClientDataset(ctx.cliente.cliente_id, filters);
+    let rows = data.evidences.map((item) => buildEvidenceView(item, data.marcaMap, data.visitMap, data.tiendaMap, data.promotorMap));
+    if (norm(filters.tienda_id)) rows = rows.filter((item) => item.tienda_id === norm(filters.tienda_id));
+    if (norm(filters.tipo_evidencia)) rows = rows.filter((item) => evidenceTypeKey(item.tipo_evidencia) === evidenceTypeKey(filters.tipo_evidencia));
+    if (norm(filters.fase)) rows = rows.filter((item) => norm(item.fase) === norm(filters.fase));
+    if (upper(filters.riesgo)) rows = rows.filter((item) => upper(item.riesgo) === upper(filters.riesgo));
+    if (upper(filters.decision_supervisor)) rows = rows.filter((item) => upper(item.decision_supervisor || item.status) === upper(filters.decision_supervisor));
+    else rows = rows.filter((item) => ["APROBADA", "OBSERVADA"].includes(upper(item.decision_supervisor || item.status)));
+    rows.sort((a, b) => String(b.fecha_hora).localeCompare(String(a.fecha_hora)));
+    const paged = paginateRows(rows, req.body?.pagination || { page_size: 40 });
+    return clientOk(res, { rows: paged.rows }, paged.meta);
+  } catch (error) {
+    return clientFail(res, error.message === "Solo cliente" ? 403 : 500, error.message || "cliente evidences error");
+  }
+});
+
+app.post("/miniapp/cliente/incidents", async (req, res) => {
+  try {
+    const ctx = await getClientScopeFromRequest(req);
+    const filters = req.body?.filters || req.body || {};
+    const data = await getClientDataset(ctx.cliente.cliente_id, filters);
+    let rows = data.alerts.map((item) => ({
+      ...item,
+      fecha_hora_fmt: fmtDateTimeTZ(item.fecha_hora),
+      promotor_nombre: data.promotorMap[item.promotor_id]?.nombre || item.promotor_id,
+      tienda_nombre: data.tiendaMap[item.tienda_id]?.nombre_tienda || item.tienda_id,
+      cadena: data.tiendaMap[item.tienda_id]?.cadena || "",
+      region: data.tiendaMap[item.tienda_id]?.region || "",
+    }));
+    if (norm(filters.tipo_alerta)) rows = rows.filter((item) => item.tipo_alerta === norm(filters.tipo_alerta));
+    if (upper(filters.severidad)) rows = rows.filter((item) => upper(item.severidad) === upper(filters.severidad));
+    if (upper(filters.status)) rows = rows.filter((item) => upper(item.status) === upper(filters.status));
+    rows.sort((a, b) => String(b.fecha_hora).localeCompare(String(a.fecha_hora)));
+    const paged = paginateRows(rows, req.body?.pagination || {});
+    return clientOk(res, { rows: paged.rows }, paged.meta);
+  } catch (error) {
+    return clientFail(res, error.message === "Solo cliente" ? 403 : 500, error.message || "cliente incidents error");
+  }
+});
+
+app.post("/miniapp/cliente/deliverables", async (req, res) => {
+  try {
+    const ctx = await getClientScopeFromRequest(req);
+    return clientOk(res, {
+      enabled: false,
+      message: `Hola ${ctx.cliente.cliente_nombre || "cliente"}. Los entregables automáticos estarán disponibles en la siguiente fase.`,
+      rows: [],
+    });
+  } catch (error) {
+    return clientFail(res, error.message === "Solo cliente" ? 403 : 500, error.message || "cliente deliverables error");
+  }
+});
 
 app.get("/health", async (_req, res) => {
   res.json({ ok: true, service: "promobolsillo-telegram", now: nowISO() });
