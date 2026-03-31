@@ -848,16 +848,36 @@ async function notifySupervisorAlert(payload) {
     const chatId = await getChatIdByExternalId(supervisorExternalId);
     if (!chatId) return false;
     const tiendaMap = await getTiendaMap();
+    const promotorMap = await getPromotorMap();
+    const marcaMap = await getMarcaMap();
     const tiendaNombre = tiendaMap[payload.tienda_id]?.nombre_tienda || payload.tienda_id || "Tienda";
+    const promotorNombre = promotorMap[payload.promotor_id]?.nombre || payload.promotor_id || "Promotor";
+    const evidenciaFound = payload.evidencia_id ? await getEvidenceById(payload.evidencia_id) : null;
+    const evidencia = evidenciaFound?.evidence || null;
+    const marcaNombre = evidencia?.marca_id ? (marcaMap[evidencia.marca_id]?.marca_nombre || evidencia.marca_id) : "";
     const text = [
       "🚨 *Nueva alerta*",
       "",
       `Tipo: *${payload.tipo_alerta || "ALERTA"}*`,
       `Severidad: *${payload.severidad || "MEDIA"}*`,
+      `Promotor: *${promotorNombre}*`,
       `Tienda: *${tiendaNombre}*`,
+      marcaNombre ? `Marca: *${marcaNombre}*` : "",
+      evidencia?.tipo_evidencia ? `Evidencia: *${evidencia.tipo_evidencia}*` : "",
+      evidencia?.fase && upper(evidencia.fase) !== "NA" ? `Fase: *${evidencia.fase}*` : "",
       payload.descripcion ? `Detalle: ${payload.descripcion}` : "",
-    ].filter(Boolean).join("\n");
-    await sendTelegramText(chatId, text, { inline_keyboard: [[{ text: "Abrir panel", web_app: { url: getMiniAppUrl() } }]] });
+    ].filter(Boolean).join("
+");
+    const markup = { inline_keyboard: [[{ text: "Abrir panel", web_app: { url: getMiniAppUrl() } }]] };
+    if (evidencia?.url_foto && evidencia.url_foto !== "[IMAGE_TOO_LARGE_FOR_SHEETS]") {
+      try {
+        await sendTelegramPhoto(chatId, evidencia.url_foto, text, markup);
+        return true;
+      } catch (photoError) {
+        console.warn("notifySupervisorAlert photo fallback", photoError?.message || photoError);
+      }
+    }
+    await sendTelegramText(chatId, text, markup);
     return true;
   } catch (error) {
     console.warn("notifySupervisorAlert error", error?.message || error);
@@ -1152,6 +1172,324 @@ async function getReglasPorMarca(marcaId) {
   return merged;
 }
 
+async function getAsignacionesActivas() {
+  const rows = await getSheetValues("ASIGNACIONES!A2:D");
+  return rows
+    .filter((row) => norm(row[0]) && norm(row[1]) && isTrue(row[3] ?? "TRUE"))
+    .map((row) => ({ promotor_id: norm(row[0]), tienda_id: norm(row[1]), frecuencia: upper(row[2]), activa: true }));
+}
+
+async function getPlaneacionHeader() {
+  return getSheetHeader("PLANEACION_VISITAS");
+}
+
+function parsePlaneacionRow(row, idx, header) {
+  const map = headerIndexMap(header);
+  return {
+    rowIndex: idx + 2,
+    plan_id: norm(row[map.plan_id]),
+    fecha: norm(row[map.fecha]),
+    promotor_id: norm(row[map.promotor_id]),
+    tienda_id: norm(row[map.tienda_id]),
+    estatus: upper(row[map.estatus] || "PLANEADA"),
+    origen: norm(row[map.origen]),
+    override_note: norm(row[map.override_note]),
+    updated_at: norm(row[map.updated_at]),
+  };
+}
+
+function buildPlaneacionRowFromHeader(header, payload) {
+  const row = new Array(header.length).fill("");
+  header.forEach((name, idx) => {
+    const key = norm(name);
+    row[idx] = payload[key] != null ? payload[key] : "";
+  });
+  return row;
+}
+
+async function getPlaneacionRowsAll() {
+  const header = await getPlaneacionHeader();
+  const rows = await getSheetValues(`PLANEACION_VISITAS!A2:${headerRangeEnd(header.length)}`);
+  return { header, rows: rows.map((row, idx) => parsePlaneacionRow(row, idx, header)) };
+}
+
+async function getPlaneacionByDate(dateYmd) {
+  const { rows } = await getPlaneacionRowsAll();
+  return rows.filter((item) => item.fecha === dateYmd);
+}
+
+async function findPlaneacionForVisit(fecha, promotorId, tiendaId) {
+  const rows = await getPlaneacionByDate(fecha);
+  return rows.find((item) => item.promotor_id === promotorId && item.tienda_id === tiendaId && ["PLANEADA", "REPROGRAMADA"].includes(item.estatus)) || null;
+}
+
+async function updatePlaneacionRow(header, planRow, patch = {}) {
+  const row = buildPlaneacionRowFromHeader(header, { ...planRow, ...patch });
+  await updateSheetValues(`PLANEACION_VISITAS!A${planRow.rowIndex}:${headerRangeEnd(header.length)}${planRow.rowIndex}`, [row]);
+}
+
+const SPANISH_WEEKDAY_TO_INDEX = { LUNES: 0, MARTES: 1, MIERCOLES: 2, 'MIÉRCOLES': 2, JUEVES: 3, VIERNES: 4, SABADO: 5, 'SÁBADO': 5, DOMINGO: 6 };
+
+async function generatePlaneacionForRange(startDateYmd, endDateYmd) {
+  const asignaciones = await getAsignacionesActivas();
+  const start = new Date(`${startDateYmd}T00:00:00`);
+  const end = new Date(`${endDateYmd}T00:00:00`);
+  const rows = [];
+  for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+    const ymd = d.toISOString().slice(0, 10);
+    const weekday = (d.getUTCDay() + 6) % 7;
+    for (const item of asignaciones) {
+      if (SPANISH_WEEKDAY_TO_INDEX[item.frecuencia] !== weekday) continue;
+      rows.push({
+        plan_id: `PLAN-${ymd.replace(/-/g, "")}-${item.promotor_id}-${item.tienda_id}`,
+        fecha: ymd,
+        promotor_id: item.promotor_id,
+        tienda_id: item.tienda_id,
+        estatus: "PLANEADA",
+        origen: "ASIGNACION",
+        override_note: "",
+        updated_at: nowISO(),
+      });
+    }
+  }
+  return rows;
+}
+
+async function upsertPlaneacionRows(payloadRows = []) {
+  if (!payloadRows.length) return { inserted: 0, updated: 0 };
+  const { header, rows } = await getPlaneacionRowsAll();
+  const existingById = new Map(rows.map((r) => [r.plan_id, r]));
+  const inserts = [];
+  let updated = 0;
+  for (const item of payloadRows) {
+    const existing = existingById.get(item.plan_id);
+    if (existing) {
+      await updatePlaneacionRow(header, existing, item);
+      updated += 1;
+    } else {
+      inserts.push(buildPlaneacionRowFromHeader(header, item));
+    }
+  }
+  if (inserts.length) await appendSheetValues(`PLANEACION_VISITAS!A2:${headerRangeEnd(header.length)}`, inserts);
+  return { inserted: inserts.length, updated };
+}
+
+async function getTiendaMarcasActivasByTiendaId(tiendaId) {
+  const rows = await getSheetValues("TIENDA_MARCAS!A2:D");
+  return rows
+    .filter((row) => norm(row[0]) === tiendaId && isTrue(row[2] ?? "TRUE"))
+    .map((row) => ({ tienda_id: norm(row[0]), marca_id: norm(row[1]), activa: true, observaciones: norm(row[3]) }));
+}
+
+async function getTareasVisitaHeader() {
+  return getSheetHeader("TAREAS_VISITA");
+}
+
+function parseTareaVisitaRow(row, idx, header) {
+  const map = headerIndexMap(header);
+  return {
+    rowIndex: idx + 2,
+    tarea_id: norm(row[map.tarea_id]),
+    visita_id: norm(row[map.visita_id]),
+    plan_id: norm(row[map.plan_id]),
+    fecha: norm(row[map.fecha]),
+    promotor_id: norm(row[map.promotor_id]),
+    tienda_id: norm(row[map.tienda_id]),
+    marca_id: norm(row[map.marca_id]),
+    tipo_evidencia: canonicalEvidenceTypeLabel(row[map.tipo_evidencia]),
+    fotos_requeridas: safeInt(row[map.fotos_requeridas], 0),
+    requiere_antes_despues: isTrue(row[map.requiere_antes_despues]),
+    estatus: upper(row[map.estatus] || "PENDIENTE"),
+    total_fotos_cargadas: safeInt(row[map.total_fotos_cargadas], 0),
+    alerta_generada: upper(row[map.alerta_generada] || "FALSE"),
+    updated_at: norm(row[map.updated_at]),
+  };
+}
+
+function buildTareaVisitaRowFromHeader(header, payload) {
+  const row = new Array(header.length).fill("");
+  header.forEach((name, idx) => {
+    const key = norm(name);
+    row[idx] = payload[key] != null ? payload[key] : "";
+  });
+  return row;
+}
+
+async function getTareasRowsAll() {
+  const header = await getTareasVisitaHeader();
+  const rows = await getSheetValues(`TAREAS_VISITA!A2:${headerRangeEnd(header.length)}`);
+  return { header, rows: rows.map((row, idx) => parseTareaVisitaRow(row, idx, header)) };
+}
+
+async function getTareasByVisitaId(visitaId) {
+  const { rows } = await getTareasRowsAll();
+  return rows.filter((item) => item.visita_id === visitaId);
+}
+
+async function getTareasByFecha(dateYmd) {
+  const { rows } = await getTareasRowsAll();
+  return rows.filter((item) => item.fecha === dateYmd);
+}
+
+async function updateTareaVisitaRow(header, tareaRow, patch = {}) {
+  const row = buildTareaVisitaRowFromHeader(header, { ...tareaRow, ...patch });
+  await updateSheetValues(`TAREAS_VISITA!A${tareaRow.rowIndex}:${headerRangeEnd(header.length)}${tareaRow.rowIndex}`, [row]);
+}
+
+async function createTareasForVisita({ visitaId, planId, fecha, promotorId, tiendaId }) {
+  const current = await getTareasByVisitaId(visitaId);
+  if (current.length) return current;
+  const tiendaMarcas = await getTiendaMarcasActivasByTiendaId(tiendaId);
+  const header = await getTareasVisitaHeader();
+  const rows = [];
+  const created = [];
+  for (const tm of tiendaMarcas) {
+    const reglas = await getReglasPorMarca(tm.marca_id);
+    for (const regla of reglas) {
+      const payload = {
+        tarea_id: `TV-${Date.now()}-${tm.marca_id}-${evidenceTypeKey(regla.tipo_evidencia).replace(/[^A-Z0-9]+/g, "").slice(0, 24)}`,
+        visita_id: visitaId,
+        plan_id: planId || "",
+        fecha,
+        promotor_id: promotorId,
+        tienda_id: tiendaId,
+        marca_id: tm.marca_id,
+        tipo_evidencia: canonicalEvidenceTypeLabel(regla.tipo_evidencia),
+        fotos_requeridas: safeInt(regla.fotos_requeridas, 1),
+        requiere_antes_despues: regla.requiere_antes_despues ? "TRUE" : "FALSE",
+        estatus: "PENDIENTE",
+        total_fotos_cargadas: 0,
+        alerta_generada: "FALSE",
+        updated_at: nowISO(),
+      };
+      rows.push(buildTareaVisitaRowFromHeader(header, payload));
+      created.push(payload)
+    }
+  }
+  if (rows.length) await appendSheetValues(`TAREAS_VISITA!A2:${headerRangeEnd(header.length)}`, rows);
+  return created;
+}
+
+function getValidEvidenceRowsForTask(evidences, task) {
+  return evidences.filter((item) => item.visita_id === task.visita_id && item.marca_id === task.marca_id && evidenceTypeKey(item.tipo_evidencia) === evidenceTypeKey(task.tipo_evidencia) && upper(item.status) !== "ANULADA");
+}
+
+function countAntesDespuesForTask(evidences, task) {
+  const rows = getValidEvidenceRowsForTask(evidences, task);
+  return {
+    total: rows.length,
+    antes: rows.filter((r) => upper(r.fase) === "ANTES").length,
+    despues: rows.filter((r) => upper(r.fase) === "DESPUES").length,
+  };
+}
+
+function resolveTaskStatus(task, counters) {
+  if (!counters.total) return { estatus: "PENDIENTE", total_fotos_cargadas: 0 };
+  const required = safeInt(task.fotos_requeridas, 1);
+  if (task.requiere_antes_despues) {
+    if (counters.antes >= 1 && counters.despues >= 1 && counters.total >= required) {
+      return { estatus: "CUMPLIDA", total_fotos_cargadas: counters.total };
+    }
+    return { estatus: "INCOMPLETA", total_fotos_cargadas: counters.total };
+  }
+  if (counters.total >= required) return { estatus: "CUMPLIDA", total_fotos_cargadas: counters.total };
+  return { estatus: "INCOMPLETA", total_fotos_cargadas: counters.total };
+}
+
+async function recalculateTareasForVisita(visitaId) {
+  const tareasPack = await getTareasRowsAll();
+  const tareas = tareasPack.rows.filter((item) => item.visita_id === visitaId);
+  if (!tareas.length) return [];
+  const evidences = await getEvidenciasByVisitId(visitaId);
+  const updated = [];
+  for (const task of tareas) {
+    const counters = countAntesDespuesForTask(evidences, task);
+    const resolved = resolveTaskStatus(task, counters);
+    await updateTareaVisitaRow(tareasPack.header, task, { ...resolved, updated_at: nowISO() });
+    updated.push({ ...task, ...resolved });
+  }
+  return updated;
+}
+
+function isVisitValidForPlan(visit) {
+  return ["OK_EN_GEOCERCA", "OK_CON_TOLERANCIA_GPS"].includes(upper(visit?.resultado_geocerca_entrada));
+}
+
+async function getSupervisorExternalIdByPromotorId(promotorId) {
+  const rows = await getSheetValues("PROMOTORES!A2:H");
+  const row = rows.find((r) => norm(r[1]) === promotorId);
+  return row ? norm(row[6]) : "";
+}
+
+async function createNoVisitaAlert(planRow) {
+  const supervisor_id = await getSupervisorExternalIdByPromotorId(planRow.promotor_id);
+  return createAlert({
+    alerta_id: `ALT-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    fecha_hora: nowISO(),
+    promotor_id: planRow.promotor_id,
+    visita_id: "",
+    evidencia_id: "",
+    tipo_alerta: "NO_VISITA_TIENDA",
+    severidad: "ALTA",
+    descripcion: `No se registró entrada válida para ${planRow.tienda_id} en la fecha ${planRow.fecha}`,
+    status: "ABIERTA",
+    supervisor_id,
+    tienda_id: planRow.tienda_id,
+    canal_notificacion: "PLANEACION",
+  });
+}
+
+async function createIncumplimientoEvidenciaAlert(taskRow) {
+  const supervisor_id = await getSupervisorExternalIdByPromotorId(taskRow.promotor_id);
+  const evidences = await getEvidenciasByVisitId(taskRow.visita_id);
+  const representative = evidences
+    .filter((item) => upper(item.status) !== "ANULADA" && item.marca_id === taskRow.marca_id && evidenceTypeKey(item.tipo_evidencia) === evidenceTypeKey(taskRow.tipo_evidencia))
+    .sort((a, b) => String(b.fecha_hora).localeCompare(String(a.fecha_hora)))[0] || null;
+  return createAlert({
+    alerta_id: `ALT-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    fecha_hora: nowISO(),
+    promotor_id: taskRow.promotor_id,
+    visita_id: taskRow.visita_id,
+    evidencia_id: representative?.evidencia_id || "",
+    tipo_alerta: "INCUMPLIMIENTO_EVIDENCIA",
+    severidad: "MEDIA",
+    descripcion: `Incumplimiento en ${taskRow.marca_id} / ${taskRow.tipo_evidencia}. Requeridas: ${taskRow.fotos_requeridas}, cargadas: ${taskRow.total_fotos_cargadas}`,
+    status: "ABIERTA",
+    supervisor_id,
+    tienda_id: taskRow.tienda_id,
+    canal_notificacion: "TAREAS_VISITA",
+  });
+}
+
+async function runDailyComplianceClose(dateYmd) {
+  const planeacionPack = await getPlaneacionRowsAll();
+  const planeacion = planeacionPack.rows.filter((item) => item.fecha === dateYmd);
+  const visitMap = await getAllVisitsMap();
+  const allVisits = Object.values(visitMap).filter((v) => v.fecha === dateYmd);
+  let noVisitAlerts = 0;
+  for (const plan of planeacion) {
+    if (!["PLANEADA", "REPROGRAMADA"].includes(plan.estatus)) continue;
+    const validVisit = allVisits.find((v) => v.promotor_id === plan.promotor_id && v.tienda_id === plan.tienda_id && isVisitValidForPlan(v));
+    if (!validVisit) {
+      await updatePlaneacionRow(planeacionPack.header, plan, { estatus: "NO_VISITADA", updated_at: nowISO() });
+      await createNoVisitaAlert(plan);
+      noVisitAlerts += 1;
+    }
+  }
+  const tareasPack = await getTareasRowsAll();
+  let incumplimientoAlerts = 0;
+  for (const tarea of tareasPack.rows.filter((item) => item.fecha === dateYmd)) {
+    if (["CUMPLIDA", "INCUMPLIDA"].includes(tarea.estatus)) continue;
+    await updateTareaVisitaRow(tareasPack.header, tarea, { estatus: "INCUMPLIDA", updated_at: nowISO() });
+    if (upper(tarea.alerta_generada) !== "TRUE") {
+      await createIncumplimientoEvidenciaAlert(tarea);
+      await updateTareaVisitaRow(tareasPack.header, tarea, { alerta_generada: "TRUE", updated_at: nowISO(), estatus: "INCUMPLIDA" });
+      incumplimientoAlerts += 1;
+    }
+  }
+  return { noVisitAlerts, incumplimientoAlerts };
+}
+
 async function getAllVisitsMap() {
   const header = await getVisitsHeader();
   const rows = await getSheetValues(`VISITAS!A2:${headerRangeEnd(header.length)}`);
@@ -1179,6 +1517,67 @@ async function getPromotorMap() {
     };
   });
   return map;
+}
+
+function estimateBytesFromDataUrl(dataUrl) {
+  const raw = norm(dataUrl);
+  const match = raw.match(/^data:[^;]+;base64,(.+)$/);
+  if (!match) return 0;
+  const base64 = match[1] || "";
+  const padding = (base64.match(/=*$/) || [""])[0].length;
+  return Math.max(0, Math.floor((base64.length * 3) / 4) - padding);
+}
+
+function estimateBytesFromEvidenceRow(evidence) {
+  const photo = norm(evidence?.url_foto);
+  if (photo.startsWith("data:")) {
+    return estimateBytesFromDataUrl(photo);
+  }
+  const note = norm(evidence?.note);
+  const overflowMatch = note.match(/FOTO_EXCEDIDA_EN_SHEETS:(\d+)/i);
+  if (overflowMatch) {
+    const originalChars = safeInt(overflowMatch[1], 0);
+    return Math.max(0, Math.floor((Math.max(0, originalChars - 32) * 3) / 4));
+  }
+  if (photo && /^https?:\/\//i.test(photo)) {
+    return 180000;
+  }
+  return 0;
+}
+
+function summarizeUsageFromRows(rows) {
+  const totalBytes = rows.reduce((sum, row) => sum + estimateBytesFromEvidenceRow(row), 0);
+  const mb = Number((totalBytes / (1024 * 1024)).toFixed(2));
+  const gb = Number((totalBytes / (1024 * 1024 * 1024)).toFixed(3));
+  return {
+    bytes: totalBytes,
+    mb,
+    gb,
+    fotos: rows.filter((row) => !!norm(row.url_foto)).length,
+  };
+}
+
+async function getPromotorUsageStats(externalId) {
+  const all = await getEvidenciasAll();
+  const rows = all.filter((row) => row.external_id === externalId && !!norm(row.url_foto) && upper(row.status) !== "ANULADA");
+  const today = todayISO();
+  const monthPrefix = today.slice(0, 7);
+  const todayRows = rows.filter((row) => row.fecha_hora && ymdInTZ(new Date(row.fecha_hora), APP_TZ) === today);
+  const monthRows = rows.filter((row) => row.fecha_hora && ymdInTZ(new Date(row.fecha_hora), APP_TZ).startsWith(monthPrefix));
+  const todayUsage = summarizeUsageFromRows(todayRows);
+  const monthUsage = summarizeUsageFromRows(monthRows);
+  const referencePct = Math.min(100, Number(((monthUsage.mb / 1024) * 100).toFixed(1)));
+  const referenceMx = Math.round((referencePct / 100) * 200);
+  return {
+    today: todayUsage,
+    month: monthUsage,
+    reference: {
+      budget_mxn: 200,
+      reference_pct: referencePct,
+      estimated_mxn: referenceMx,
+      note: "Referencia visual: si la recarga de $200 equivale aprox. a 1 GB. No es saldo real del operador.",
+    },
+  };
 }
 
 function buildEvidenceView(item, marcaMap, visitMap, tiendaMap, promotorMap) {
@@ -1458,14 +1857,14 @@ async function buildGeofenceContext(tiendaId, lat, lon, accuracy) {
   };
 }
 
-async function createGeofenceAlertIfNeeded(visitId, promotor, tiendaId, tipo, geofence) {
+async function createGeofenceAlertIfNeeded(visitId, promotor, tiendaId, tipo, geofence, evidenciaId = "") {
   if (upper(geofence.resultado) !== "FUERA_DE_GEOCERCA") return false;
   return createAlert({
     alerta_id: `ALT-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
     fecha_hora: nowISO(),
     promotor_id: promotor.promotor_id,
     visita_id: visitId,
-    evidencia_id: "",
+    evidencia_id: evidenciaId || "",
     tipo_alerta: tipo,
     severidad: "ALTA",
     descripcion: `Registro ${tipo === "GEOCERCA_ENTRADA" ? "de entrada" : "de salida"} fuera de geocerca. Distancia ${geofence.distancia_m || "N/D"}m.`,
@@ -1502,6 +1901,38 @@ async function sendTelegramText(chatId, text, reply_markup) {
     disable_web_page_preview: true,
     reply_markup,
   });
+}
+
+async function sendTelegramPhoto(chatId, photoValue, caption = "", reply_markup) {
+  if (!photoValue) return false;
+  if (!TELEGRAM_API) return false;
+  const isHttp = /^https?:\/\//i.test(photoValue);
+  if (isHttp) {
+    await telegramApi("sendPhoto", {
+      chat_id: chatId,
+      photo: photoValue,
+      caption,
+      parse_mode: "Markdown",
+      reply_markup,
+    });
+    return true;
+  }
+  const parsed = parseDataUrl(photoValue);
+  if (!parsed) return false;
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  if (caption) form.append("caption", caption);
+  form.append("parse_mode", "Markdown");
+  if (reply_markup) form.append("reply_markup", JSON.stringify(reply_markup));
+  const ext = parsed.mime === "image/png" ? "png" : parsed.mime === "image/webp" ? "webp" : "jpg";
+  const blob = new Blob([parsed.buffer], { type: parsed.mime || "image/jpeg" });
+  form.append("photo", blob, `alerta.${ext}`);
+  const res = await fetch(`${TELEGRAM_API}/sendPhoto`, { method: "POST", body: form });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Telegram API sendPhoto failed: ${res.status} ${text}`);
+  }
+  return true;
 }
 
 async function answerCallbackQuery(callbackQueryId, text = "") {
@@ -2009,7 +2440,14 @@ external_id: telegram:${incoming.fromId}`
 
 app.post("/miniapp/bootstrap", async (req, res) => {
   try {
-    const { actor } = await getActorFromRequest(req);
+    const { actor, validated } = await getActorFromRequest(req);
+    if (actor.role === "cliente") {
+      const ctx = await getClienteContextByExternalId(validated.external_id);
+      if (!ctx) {
+        return res.status(403).json({ ok: false, error: "Cliente no configurado. Usa una cuenta Telegram exclusiva de cliente y valida CLIENTES + ACCESOS_CLIENTE + MARCAS.cliente_id." });
+      }
+      return res.json({ ok: true, role: actor.role, profile: { nombre: ctx.access.nombre_contacto || ctx.cliente.cliente_nombre || actor.profile.nombre || "Cliente" } });
+    }
     return res.json({ ok: true, role: actor.role, profile: { nombre: actor.profile.nombre || actor.profile.external_id || "Usuario" } });
   } catch (error) {
     return res.status(401).json({ ok: false, error: error.message || "auth failed" });
@@ -2028,6 +2466,7 @@ app.post("/miniapp/promotor/dashboard", async (req, res) => {
       cadena: tiendaMap[id]?.cadena || "",
     }));
     const visits = await getVisitasToday(actor.profile.promotor_id);
+    const usage = await getPromotorUsageStats(actor.profile.external_id);
     const visitsToday = visits.map((visit) => ({
       visita_id: visit.visita_id,
       tienda_id: visit.tienda_id,
@@ -2049,7 +2488,9 @@ app.post("/miniapp/promotor/dashboard", async (req, res) => {
         assignedStores: stores.length,
         openVisits: openVisits.length,
         closedVisits: visitsToday.filter((item) => !!item.hora_fin).length,
+        evidenciasHoy: usage.today.fotos,
       },
+      usage,
     });
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message || "dashboard error" });
@@ -2069,6 +2510,17 @@ app.post("/miniapp/promotor/evidences-today", async (req, res) => {
     return res.json({ ok: true, evidencias });
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message || "evidences today error" });
+  }
+});
+
+app.post("/miniapp/promotor/usage-estimate", async (req, res) => {
+  try {
+    const { actor } = await getActorFromRequest(req);
+    if (actor.role !== "promotor") return res.status(403).json({ ok: false, error: "Solo promotor" });
+    const usage = await getPromotorUsageStats(actor.profile.external_id);
+    return res.json({ ok: true, usage });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message || "usage estimate error" });
   }
 });
 
@@ -2141,6 +2593,7 @@ app.post("/miniapp/promotor/start-entry", async (req, res) => {
     if (!fotoDataUrl) return res.status(400).json({ ok: false, error: "foto requerida" });
 
     const geofence = await buildGeofenceContext(tiendaId, lat, lon, accuracy);
+    const planRow = await findPlaneacionForVisit(todayISO(), actor.profile.promotor_id, tiendaId);
     const visitId = await createVisitWithGeofence(actor.profile.promotor_id, tiendaId, "Registro de entrada", geofence);
     const evidenceId = `EV-${Date.now()}-ASIS-IN`;
     const attendanceResult = await registrarEvidencia({
@@ -2172,8 +2625,13 @@ app.post("/miniapp/promotor/start-entry", async (req, res) => {
       version_motor_ai: "",
       hash_foto: buildEvidencePhotoHash(fotoDataUrl, fotoNombre),
     });
+    if (planRow && isVisitValidForPlan({ resultado_geocerca_entrada: geofence.resultado })) {
+      const planeacionHeader = await getPlaneacionHeader();
+      await updatePlaneacionRow(planeacionHeader, planRow, { estatus: "VISITADA", updated_at: nowISO() });
+      await createTareasForVisita({ visitaId: visitId, planId: planRow.plan_id, fecha: todayISO(), promotorId: actor.profile.promotor_id, tiendaId });
+    }
     if (upper(geofence.resultado) === "FUERA_DE_GEOCERCA") {
-      await createGeofenceAlertIfNeeded(visitId, actor.profile, tiendaId, "GEOCERCA_ENTRADA", geofence);
+      await createGeofenceAlertIfNeeded(visitId, actor.profile, tiendaId, "GEOCERCA_ENTRADA", geofence, evidenceId);
     }
     return res.json({
       ok: true,
@@ -2182,6 +2640,7 @@ app.post("/miniapp/promotor/start-entry", async (req, res) => {
       tienda_nombre: geofence.tienda?.nombre_tienda || tiendaId,
       started_at: nowISO(),
       warning: attendanceResult.photoOverflow ? "attendance_photo_too_large_for_sheets" : undefined,
+      plan_status: planRow ? (isVisitValidForPlan({ resultado_geocerca_entrada: geofence.resultado }) ? "VISITADA" : "PLANEADA") : "SIN_PLANEACION",
     });
   } catch (error) {
     console.error("start-entry error", error);
@@ -2237,7 +2696,7 @@ app.post("/miniapp/promotor/close-visit", async (req, res) => {
       hash_foto: buildEvidencePhotoHash(fotoDataUrl, fotoNombre),
     });
     if (upper(geofence.resultado) === "FUERA_DE_GEOCERCA") {
-      await createGeofenceAlertIfNeeded(visitaId, actor.profile, visit.tienda_id, "GEOCERCA_SALIDA", geofence);
+      await createGeofenceAlertIfNeeded(visitaId, actor.profile, visit.tienda_id, "GEOCERCA_SALIDA", geofence, evidenceId);
     }
     return res.json({
       ok: true,
@@ -2312,7 +2771,8 @@ app.post("/miniapp/promotor/evidence-register", async (req, res) => {
 
     const batchResult = await registrarEvidenciasBatch(batchPayloads);
 
-    await rerunEvidencePlusForGroup(visitaId, marcaId, tipoEvidencia, fase);
+    scheduleEvidenceGroupAnalysis({ visitaId, marcaId, tipoEvidencia, fase });
+    await recalculateTareasForVisita(visitaId);
 
     return res.json({
       ok: true,
@@ -2348,6 +2808,7 @@ app.post("/miniapp/promotor/cancel-evidence", async (req, res) => {
         tipoEvidencia: found.evidence.tipo_evidencia,
         fase: found.evidence.fase || "NA",
       });
+      await recalculateTareasForVisita(found.evidence.visita_id);
     }
     return res.json({ ok: true, evidencia_id: evidenciaId, status: "ANULADA" });
   } catch (error) {
@@ -2385,6 +2846,7 @@ app.post("/miniapp/promotor/replace-evidence", async (req, res) => {
         tipoEvidencia: found.evidence.tipo_evidencia,
         fase: found.evidence.fase || "NA",
       });
+      await recalculateTareasForVisita(found.evidence.visita_id);
     }
     return res.json({ ok: true, evidencia_id: evidenciaId, replaced: true, warning: result.photoOverflow ? "evidence_photo_too_large_for_sheets" : undefined });
   } catch (error) {
@@ -2621,6 +3083,39 @@ app.post("/miniapp/supervisor/visit-expedient", async (req, res) => {
     return res.json({ ok: true, visita: visitPayload, evidencias, alertas });
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message || "visit expedient error" });
+  }
+});
+
+app.post("/ops/planeacion/generate-range", async (req, res) => {
+  try {
+    const start_date = norm(req.body?.start_date || todayISO());
+    const end_date = norm(req.body?.end_date || start_date);
+    const rows = await generatePlaneacionForRange(start_date, end_date);
+    const summary = await upsertPlaneacionRows(rows);
+    return res.json({ ok: true, start_date, end_date, total_rows: rows.length, ...summary });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message || "planeacion generate-range error" });
+  }
+});
+
+app.post("/ops/compliance/run-close", async (req, res) => {
+  try {
+    const date = norm(req.body?.date || todayISO());
+    const result = await runDailyComplianceClose(date);
+    return res.json({ ok: true, date, ...result });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message || "compliance run-close error" });
+  }
+});
+
+app.post("/ops/tareas/rebuild-visita", async (req, res) => {
+  try {
+    const visita_id = norm(req.body?.visita_id);
+    if (!visita_id) return res.status(400).json({ ok: false, error: "visita_id requerido" });
+    const rows = await recalculateTareasForVisita(visita_id);
+    return res.json({ ok: true, visita_id, updated: rows.length });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message || "tareas rebuild-visita error" });
   }
 });
 
