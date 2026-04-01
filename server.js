@@ -548,6 +548,59 @@ async function getClienteContextByExternalId(externalId) {
   return { access, cliente };
 }
 
+async function getClienteResolutionDebug(externalId) {
+  const debug = {
+    external_id: norm(externalId),
+    access_rows: 0,
+    access_match: false,
+    access_cliente_id: "",
+    access_error: "",
+    client_rows: 0,
+    client_found: false,
+    client_id_checked: "",
+    client_error: "",
+    result: "UNKNOWN",
+  };
+
+  try {
+    const accessRows = await getSheetValues("ACCESOS_CLIENTE!A2:G");
+    debug.access_rows = accessRows.length;
+    const row = accessRows.find((r) => {
+      const activo = r.length >= 6 ? isTrue(r[5]) : true;
+      return norm(r[2]) === debug.external_id && activo;
+    });
+    if (row) {
+      debug.access_match = true;
+      debug.access_cliente_id = norm(row[1]);
+      debug.client_id_checked = norm(row[1]);
+    }
+  } catch (error) {
+    debug.access_error = error?.message || String(error);
+  }
+
+  try {
+    const clientRows = await getSheetValues("CLIENTES!A2:G");
+    debug.client_rows = clientRows.length;
+    if (debug.client_id_checked) {
+      const row = clientRows.find((r) => {
+        const activo = r.length >= 3 ? isTrue(r[2]) : true;
+        return norm(r[0]) === debug.client_id_checked && activo;
+      });
+      debug.client_found = !!row;
+    }
+  } catch (error) {
+    debug.client_error = error?.message || String(error);
+  }
+
+  if (debug.access_error) debug.result = "CLIENT_ACCESS_SHEET_ERROR";
+  else if (!debug.access_match) debug.result = "CLIENT_ACCESS_NOT_FOUND";
+  else if (debug.client_error) debug.result = "CLIENT_RECORD_SHEET_ERROR";
+  else if (!debug.client_found) debug.result = "CLIENT_RECORD_NOT_FOUND";
+  else debug.result = "CLIENT_READY_BUT_ROLE_NOT_RESOLVED";
+
+  return debug;
+}
+
 async function resolveActor(externalId) {
   const supervisor = await getSupervisorByExternalId(externalId);
   if (supervisor) return { role: "supervisor", profile: supervisor };
@@ -2451,9 +2504,10 @@ app.post("/miniapp/bootstrap", async (req, res) => {
     const { actor, validated } = await getActorFromRequest(req);
 
     if (actor.role === "guest") {
+      const clientDebug = await getClienteResolutionDebug(validated.external_id);
       return res.status(403).json({
         ok: false,
-        error: `Cuenta no configurada. external_id detectado: ${validated.external_id}. Verifica si esta cuenta debe entrar como promotor, supervisor o cliente.`,
+        error: `Cuenta no configurada. external_id detectado: ${validated.external_id}. client_debug=${clientDebug.result}; access_match=${clientDebug.access_match}; access_cliente_id=${clientDebug.access_cliente_id || "NA"}; client_found=${clientDebug.client_found}; access_rows=${clientDebug.access_rows}; client_rows=${clientDebug.client_rows}; access_error=${clientDebug.access_error || "NA"}; client_error=${clientDebug.client_error || "NA"}. Verifica si esta cuenta debe entrar como promotor, supervisor o cliente.`,
       });
     }
 
