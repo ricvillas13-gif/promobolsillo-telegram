@@ -2453,7 +2453,7 @@ app.post("/miniapp/bootstrap", async (req, res) => {
     if (actor.role === "guest") {
       return res.status(403).json({
         ok: false,
-        error: "Cuenta no configurada. Verifica si esta cuenta debe entrar como promotor, supervisor o cliente.",
+        error: `Cuenta no configurada. external_id detectado: ${validated.external_id}. Verifica si esta cuenta debe entrar como promotor, supervisor o cliente.`,
       });
     }
 
@@ -2462,7 +2462,7 @@ app.post("/miniapp/bootstrap", async (req, res) => {
       if (!ctx) {
         return res.status(403).json({
           ok: false,
-          error: "Cliente no configurado. Usa una cuenta Telegram exclusiva de cliente y valida CLIENTES + ACCESOS_CLIENTE + MARCAS.cliente_id.",
+          error: `Cliente no configurado. external_id detectado: ${validated.external_id}. Valida CLIENTES + ACCESOS_CLIENTE + MARCAS.cliente_id.`,
         });
       }
       return res.json({
