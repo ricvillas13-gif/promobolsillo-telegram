@@ -551,8 +551,10 @@ async function getClienteContextByExternalId(externalId) {
 async function resolveActor(externalId) {
   const supervisor = await getSupervisorByExternalId(externalId);
   if (supervisor) return { role: "supervisor", profile: supervisor };
+
   const promotor = await getPromotorByExternalId(externalId);
   if (promotor) return { role: "promotor", profile: promotor };
+
   const clienteCtx = await getClienteContextByExternalId(externalId);
   if (clienteCtx) {
     return {
@@ -566,7 +568,14 @@ async function resolveActor(externalId) {
       },
     };
   }
-  return { role: "cliente", profile: { external_id: externalId, nombre: "Cliente" } };
+
+  return {
+    role: "guest",
+    profile: {
+      external_id: externalId,
+      nombre: "Usuario",
+    },
+  };
 }
 
 async function findSessionRow(externalId) {
@@ -2440,14 +2449,38 @@ external_id: telegram:${incoming.fromId}`
 app.post("/miniapp/bootstrap", async (req, res) => {
   try {
     const { actor, validated } = await getActorFromRequest(req);
+
+    if (actor.role === "guest") {
+      return res.status(403).json({
+        ok: false,
+        error: "Cuenta no configurada. Verifica si esta cuenta debe entrar como promotor, supervisor o cliente.",
+      });
+    }
+
     if (actor.role === "cliente") {
       const ctx = await getClienteContextByExternalId(validated.external_id);
       if (!ctx) {
-        return res.status(403).json({ ok: false, error: "Cliente no configurado. Usa una cuenta Telegram exclusiva de cliente y valida CLIENTES + ACCESOS_CLIENTE + MARCAS.cliente_id." });
+        return res.status(403).json({
+          ok: false,
+          error: "Cliente no configurado. Usa una cuenta Telegram exclusiva de cliente y valida CLIENTES + ACCESOS_CLIENTE + MARCAS.cliente_id.",
+        });
       }
-      return res.json({ ok: true, role: actor.role, profile: { nombre: ctx.access.nombre_contacto || ctx.cliente.cliente_nombre || actor.profile.nombre || "Cliente" } });
+      return res.json({
+        ok: true,
+        role: actor.role,
+        profile: {
+          nombre: ctx.access.nombre_contacto || ctx.cliente.cliente_nombre || actor.profile.nombre || "Cliente",
+        },
+      });
     }
-    return res.json({ ok: true, role: actor.role, profile: { nombre: actor.profile.nombre || actor.profile.external_id || "Usuario" } });
+
+    return res.json({
+      ok: true,
+      role: actor.role,
+      profile: {
+        nombre: actor.profile.nombre || actor.profile.external_id || "Usuario",
+      },
+    });
   } catch (error) {
     return res.status(401).json({ ok: false, error: error.message || "auth failed" });
   }
