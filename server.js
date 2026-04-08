@@ -26,6 +26,9 @@ const EVPLUS_MIN_DIMENSION = 420;
 const EVPLUS_MIN_ESTIMATED_BYTES = 9000;
 const PHOTO_CELL_LIMIT = 48000;
 const pendingEvidenceAnalysisTimers = new Map();
+const pendingVisitTaskRecalcTimers = new Map();
+const SHEET_READ_CACHE_TTL_MS = 8000;
+const sheetReadCache = new Map();
 
 const ALLOWED_ORIGINS = [MINIAPP_BASE_URL, PUBLIC_BASE_URL, "http://localhost:5173", "https://localhost:5173"].filter(Boolean);
 
@@ -321,6 +324,25 @@ function scheduleEvidenceGroupAnalysis({ visitaId, marcaId, tipoEvidencia, fase 
   pendingEvidenceAnalysisTimers.set(key, timer);
 }
 
+function scheduleVisitTaskRecalculation(visitaId, delayMs = 1800) {
+  const key = norm(visitaId);
+  if (!key) return;
+  const existing = pendingVisitTaskRecalcTimers.get(key);
+  if (existing) clearTimeout(existing);
+  const timer = setTimeout(async () => {
+    pendingVisitTaskRecalcTimers.delete(key);
+    try {
+      await recalculateTareasForVisita(key);
+    } catch (error) {
+      console.warn("scheduleVisitTaskRecalculation error", {
+        visitaId: key,
+        message: error?.message || error,
+      });
+    }
+  }, delayMs);
+  pendingVisitTaskRecalcTimers.set(key, timer);
+}
+
 function verifyTelegramInitData(initData) {
   if (!TELEGRAM_BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN no configurado para validar initData");
   const params = new URLSearchParams(initData);
@@ -363,6 +385,44 @@ async function getActorFromRequest(req) {
 
 let sheetsClient = null;
 
+function clone2dValues(values) {
+  return (values || []).map((row) => (Array.isArray(row) ? [...row] : row));
+}
+
+function sheetNameFromRange(range = "") {
+  const raw = norm(String(range).split("!")[0]);
+  return raw.replace(/^'/, "").replace(/'$/, "");
+}
+
+function invalidateSheetCache(sheetNameOrRange = "") {
+  const sheetName = sheetNameFromRange(sheetNameOrRange);
+  if (!sheetName) {
+    sheetReadCache.clear();
+    return;
+  }
+  for (const key of Array.from(sheetReadCache.keys())) {
+    if (sheetNameFromRange(key) === sheetName) sheetReadCache.delete(key);
+  }
+}
+
+function readSheetCache(range) {
+  const cached = sheetReadCache.get(range);
+  if (!cached) return null;
+  if (cached.expiresAt <= Date.now()) {
+    sheetReadCache.delete(range);
+    return null;
+  }
+  return clone2dValues(cached.values);
+}
+
+function writeSheetCache(range, values) {
+  sheetReadCache.set(range, {
+    values: clone2dValues(values),
+    expiresAt: Date.now() + SHEET_READ_CACHE_TTL_MS,
+  });
+}
+
+
 async function getSheetsClient() {
   if (sheetsClient) return sheetsClient;
   const credentials = JSON.parse(GOOGLE_SERVICE_ACCOUNT_JSON);
@@ -375,10 +435,17 @@ async function getSheetsClient() {
   return sheetsClient;
 }
 
-async function getSheetValues(range) {
+async function getSheetValues(range, options = {}) {
+  const useCache = options.useCache !== false;
+  if (useCache) {
+    const cached = readSheetCache(range);
+    if (cached) return cached;
+  }
   const sheets = await getSheetsClient();
   const res = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range });
-  return res.data.values || [];
+  const values = res.data.values || [];
+  if (useCache) writeSheetCache(range, values);
+  return clone2dValues(values);
 }
 
 async function appendSheetValues(range, values) {
@@ -389,6 +456,7 @@ async function appendSheetValues(range, values) {
     valueInputOption: "USER_ENTERED",
     requestBody: { values },
   });
+  invalidateSheetCache(range);
 }
 
 async function updateSheetValues(range, values) {
@@ -399,11 +467,16 @@ async function updateSheetValues(range, values) {
     valueInputOption: "USER_ENTERED",
     requestBody: { values },
   });
+  invalidateSheetCache(range);
 }
 
 async function getSheetHeader(sheetName) {
-  const values = await getSheetValues(`${sheetName}!1:1`);
-  return (values[0] || []).map((v) => norm(v));
+  try {
+    const values = await getSheetValues(`${sheetName}!1:1`);
+    return (values[0] || []).map((v) => norm(v));
+  } catch (error) {
+    throw new Error(`No se pudo leer la hoja ${sheetName}. Verifica que exista y que el nombre sea exacto.`);
+  }
 }
 
 async function getPolicyValidation() {
@@ -776,6 +849,20 @@ async function getVisitasToday(promotorId) {
 async function getOpenVisitsToday(promotorId) {
   const visits = await getVisitasToday(promotorId);
   return visits.filter((visit) => !visit.hora_fin);
+}
+
+async function getOpenVisitConflictSummary(promotorId) {
+  const openVisits = await getOpenVisitsToday(promotorId);
+  const activeVisit = openVisits[0] || null;
+  if (!activeVisit) return null;
+  const tiendaMap = await getTiendaMap();
+  const tienda = tiendaMap[activeVisit.tienda_id];
+  return {
+    visita_id: activeVisit.visita_id,
+    tienda_id: activeVisit.tienda_id,
+    tienda_nombre: tienda?.nombre_tienda || activeVisit.tienda_id || "Tienda",
+    hora_inicio: activeVisit.hora_inicio,
+  };
 }
 
 async function getVisitById(visitaId) {
@@ -2678,6 +2765,15 @@ app.post("/miniapp/promotor/start-entry", async (req, res) => {
     if (!tiendaId) return res.status(400).json({ ok: false, error: "tienda_id requerido" });
     if (!fotoDataUrl) return res.status(400).json({ ok: false, error: "foto requerida" });
 
+    const openVisit = await getOpenVisitConflictSummary(actor.profile.promotor_id);
+    if (openVisit) {
+      return res.status(409).json({
+        ok: false,
+        error: `Ya tienes una visita abierta en ${openVisit.tienda_nombre}. Debes cerrarla antes de registrar una nueva entrada.`,
+        open_visit: openVisit,
+      });
+    }
+
     const geofence = await buildGeofenceContext(tiendaId, lat, lon, accuracy);
     const planRow = await findPlaneacionForVisit(todayISO(), actor.profile.promotor_id, tiendaId);
     const visitId = await createVisitWithGeofence(actor.profile.promotor_id, tiendaId, "Registro de entrada", geofence);
@@ -2857,8 +2953,14 @@ app.post("/miniapp/promotor/evidence-register", async (req, res) => {
 
     const batchResult = await registrarEvidenciasBatch(batchPayloads);
 
-    scheduleEvidenceGroupAnalysis({ visitaId, marcaId, tipoEvidencia, fase });
-    await recalculateTareasForVisita(visitaId);
+    const postprocessWarnings = [];
+    try {
+      scheduleEvidenceGroupAnalysis({ visitaId, marcaId, tipoEvidencia, fase });
+      scheduleVisitTaskRecalculation(visitaId);
+    } catch (postprocessError) {
+      console.warn("evidence-register postprocess warning", postprocessError?.message || postprocessError);
+      postprocessWarnings.push(postprocessError?.message || "postprocess_warning");
+    }
 
     return res.json({
       ok: true,
@@ -2867,6 +2969,7 @@ app.post("/miniapp/promotor/evidence-register", async (req, res) => {
       count: created.length,
       warning: batchResult.photoOverflow ? "evidence_photo_too_large_for_sheets" : undefined,
       analysis_status: "scheduled",
+      postprocess_warning: postprocessWarnings[0] || undefined,
     });
   } catch (error) {
     console.error("evidence-register error", error);
@@ -2894,7 +2997,7 @@ app.post("/miniapp/promotor/cancel-evidence", async (req, res) => {
         tipoEvidencia: found.evidence.tipo_evidencia,
         fase: found.evidence.fase || "NA",
       });
-      await recalculateTareasForVisita(found.evidence.visita_id);
+      scheduleVisitTaskRecalculation(found.evidence.visita_id);
     }
     return res.json({ ok: true, evidencia_id: evidenciaId, status: "ANULADA" });
   } catch (error) {
@@ -2932,7 +3035,7 @@ app.post("/miniapp/promotor/replace-evidence", async (req, res) => {
         tipoEvidencia: found.evidence.tipo_evidencia,
         fase: found.evidence.fase || "NA",
       });
-      await recalculateTareasForVisita(found.evidence.visita_id);
+      scheduleVisitTaskRecalculation(found.evidence.visita_id);
     }
     return res.json({ ok: true, evidencia_id: evidenciaId, replaced: true, warning: result.photoOverflow ? "evidence_photo_too_large_for_sheets" : undefined });
   } catch (error) {
