@@ -112,6 +112,35 @@ function buildExternalIdFromTelegramUser(userId) {
   return `telegram:${userId}`;
 }
 
+function extractStoreDeterminant(value) {
+  const match = norm(value).match(/(\d+)\s*$/);
+  return match ? match[1] : "";
+}
+
+function formatStoreDisplay(tiendaId, tiendaNombre) {
+  const determinante = extractStoreDeterminant(tiendaId);
+  const nombre = norm(tiendaNombre) || norm(tiendaId);
+  return determinante ? `${determinante} - ${nombre}` : nombre;
+}
+
+function calcVisitDurationMinutes(startIso, endIso) {
+  const start = startIso ? new Date(startIso) : null;
+  const end = endIso ? new Date(endIso) : null;
+  if (!start || !end || Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return 0;
+  return Math.max(0, Math.round((end.getTime() - start.getTime()) / 60000));
+}
+
+function fmtVisitDuration(startIso, endIso) {
+  const mins = calcVisitDurationMinutes(startIso, endIso);
+  if (!mins) return "";
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
+  if (h && m) return `${h}h ${m}m`;
+  if (h) return `${h}h`;
+  return `${m}m`;
+}
+
+
 function buildBaseUrl(req) {
   if (PUBLIC_BASE_URL) return PUBLIC_BASE_URL.replace(/\/+$/, "");
   const proto = String(req.headers["x-forwarded-proto"] || "https");
@@ -285,9 +314,6 @@ function canonicalEvidenceTypeLabel(value) {
   const raw = norm(value);
   if (!raw) return "";
   const key = normalizeTextKey(raw);
-  if (key.includes("ANAQUEL") && key.includes("ACERCAMIENTO") && key.includes("PRECIO")) {
-    return "Anaquel/acercamiento/inventario/precios";
-  }
   if (key === "COMPETENCIA") return "Competencia";
   if (key === "FACHADA TIENDA") return "Fachada tienda";
   return raw;
@@ -1217,6 +1243,32 @@ async function updateEvidenceRow(header, evidence, patch = {}) {
   return { photoOverflow: photoInfo.overflow, originalPhotoLength: photoInfo.originalLength };
 }
 
+async function appendEvidenceAuditEntry(payload = {}) {
+  const values = [[
+    nowISO(),
+    fitCell(payload.accion || ""),
+    fitCell(payload.evidencia_id || ""),
+    fitCell(payload.external_id || ""),
+    fitCell(payload.visita_id || ""),
+    fitCell(payload.tienda_id || ""),
+    fitCell(payload.marca_id || ""),
+    fitCell(payload.tipo_evidencia || ""),
+    fitCell(payload.fase || ""),
+    fitCell(payload.foto_nombre_anterior || ""),
+    fitCell(payload.hash_anterior || ""),
+    fitCell(payload.foto_nombre_nueva || ""),
+    fitCell(payload.hash_nueva || ""),
+    fitCell(payload.comentario || ""),
+  ]];
+  try {
+    await appendSheetValues("EVIDENCIAS_AUDIT!A2:N", values);
+    return true;
+  } catch (error) {
+    console.warn("appendEvidenceAuditEntry warning", error?.message || error);
+    return false;
+  }
+}
+
 async function getMarcasActivas() {
   const rows = await getSheetValues("MARCAS!A2:D");
   return rows
@@ -1732,12 +1784,14 @@ function buildEvidenceView(item, marcaMap, visitMap, tiendaMap, promotorMap) {
   const visit = visitMap[item.visita_id];
   const tienda = visit ? tiendaMap[visit.tienda_id] : null;
   const promotor = visit ? promotorMap[visit.promotor_id] : null;
+  const tiendaNombre = tienda?.nombre_tienda || visit?.tienda_id || "";
   return {
     ...item,
     marca_nombre: marcaMap[item.marca_id]?.marca_nombre || item.marca_id,
     fecha_hora_fmt: fmtDateTimeTZ(item.fecha_hora),
     tienda_id: visit?.tienda_id || "",
-    tienda_nombre: tienda?.nombre_tienda || visit?.tienda_id || "",
+    tienda_nombre: tiendaNombre,
+    tienda_display: formatStoreDisplay(visit?.tienda_id || "", tiendaNombre),
     promotor_id: visit?.promotor_id || "",
     promotor_nombre: promotor?.nombre || "",
   };
@@ -2704,14 +2758,20 @@ app.post("/miniapp/promotor/evidence-context", async (req, res) => {
     const visitaId = norm(req.body?.visita_id);
     const visit = await getVisitById(visitaId);
     if (!visit || visit.promotor_id !== actor.profile.promotor_id) return res.status(404).json({ ok: false, error: "Visita no encontrada" });
-    const marcas = await getMarcasActivas();
     const tiendaMap = await getTiendaMap();
+    const tiendaMarcas = await getTiendaMarcasActivasByTiendaId(visit.tienda_id);
+    const marcaMap = await getMarcaMap();
+    const marcas = tiendaMarcas.map((item) => ({
+      marca_id: item.marca_id,
+      marca_nombre: marcaMap[item.marca_id]?.marca_nombre || item.marca_id,
+    }));
     return res.json({
       ok: true,
       visita: {
         visita_id: visit.visita_id,
         tienda_id: visit.tienda_id,
         tienda_nombre: tiendaMap[visit.tienda_id]?.nombre_tienda || visit.tienda_id,
+        tienda_display: formatStoreDisplay(visit.tienda_id, tiendaMap[visit.tienda_id]?.nombre_tienda || visit.tienda_id),
       },
       marcas,
     });
@@ -2765,12 +2825,20 @@ app.post("/miniapp/promotor/start-entry", async (req, res) => {
     if (!tiendaId) return res.status(400).json({ ok: false, error: "tienda_id requerido" });
     if (!fotoDataUrl) return res.status(400).json({ ok: false, error: "foto requerida" });
 
-    const openVisit = await getOpenVisitConflictSummary(actor.profile.promotor_id);
-    if (openVisit) {
+    const openVisits = await getOpenVisitsToday(actor.profile.promotor_id);
+    const openVisitSameStore = openVisits.find((item) => item.tienda_id === tiendaId);
+    if (openVisitSameStore) {
+      const tiendaMap = await getTiendaMap();
+      const tiendaNombre = tiendaMap[tiendaId]?.nombre_tienda || tiendaId;
       return res.status(409).json({
         ok: false,
-        error: `Ya tienes una visita abierta en ${openVisit.tienda_nombre}. Debes cerrarla antes de registrar una nueva entrada.`,
-        open_visit: openVisit,
+        error: `Ya tienes una visita abierta en ${formatStoreDisplay(tiendaId, tiendaNombre)}. Debes cerrarla antes de registrar una nueva entrada.`,
+        open_visit: {
+          visita_id: openVisitSameStore.visita_id,
+          tienda_id: tiendaId,
+          tienda_nombre: tiendaNombre,
+          tienda_display: formatStoreDisplay(tiendaId, tiendaNombre),
+        },
       });
     }
 
@@ -2820,6 +2888,7 @@ app.post("/miniapp/promotor/start-entry", async (req, res) => {
       visita_id: visitId,
       tienda_id: tiendaId,
       tienda_nombre: geofence.tienda?.nombre_tienda || tiendaId,
+      tienda_display: formatStoreDisplay(tiendaId, geofence.tienda?.nombre_tienda || tiendaId),
       started_at: nowISO(),
       warning: attendanceResult.photoOverflow ? "attendance_photo_too_large_for_sheets" : undefined,
       plan_status: planRow ? (isVisitValidForPlan({ resultado_geocerca_entrada: geofence.resultado }) ? "VISITADA" : "PLANEADA") : "SIN_PLANEACION",
@@ -2990,6 +3059,19 @@ app.post("/miniapp/promotor/cancel-evidence", async (req, res) => {
       status: "ANULADA",
       note: note ? `${found.evidence.note ? `${found.evidence.note} | ` : ""}${note}` : found.evidence.note,
     });
+    await appendEvidenceAuditEntry({
+      accion: "ANULAR",
+      evidencia_id: evidenciaId,
+      external_id: actor.profile.external_id,
+      visita_id: found.evidence.visita_id,
+      tienda_id: (await getVisitById(found.evidence.visita_id))?.tienda_id || "",
+      marca_id: found.evidence.marca_id,
+      tipo_evidencia: found.evidence.tipo_evidencia,
+      fase: found.evidence.fase,
+      foto_nombre_anterior: found.evidence.foto_nombre,
+      hash_anterior: found.evidence.hash_foto,
+      comentario: note,
+    });
     if (upper(found.evidence.tipo_evidencia) !== "ASISTENCIA") {
       scheduleEvidenceGroupAnalysis({
         visitaId: found.evidence.visita_id,
@@ -3015,6 +3097,9 @@ app.post("/miniapp/promotor/replace-evidence", async (req, res) => {
     const found = await getEvidenceById(evidenciaId);
     if (!found) return res.status(404).json({ ok: false, error: "Evidencia no encontrada" });
     if (found.evidence.external_id !== actor.profile.external_id) return res.status(403).json({ ok: false, error: "No autorizada" });
+    const previousHash = found.evidence.hash_foto;
+    const previousPhotoName = found.evidence.foto_nombre;
+    const nextHash = buildEvidencePhotoHash(fotoDataUrl, fotoNombre);
     const result = await updateEvidenceRow(found.header, found.evidence, {
       url_foto: fotoDataUrl,
       foto_nombre: fotoNombre,
@@ -3025,8 +3110,24 @@ app.post("/miniapp/promotor/replace-evidence", async (req, res) => {
       reglas_disparadas: "",
       analizado_at: "",
       version_motor_ai: "",
-      hash_foto: buildEvidencePhotoHash(fotoDataUrl, fotoNombre),
+      hash_foto: nextHash,
       requiere_revision_supervisor: "FALSE",
+      note: `${found.evidence.note ? `${found.evidence.note} | ` : ""}REEMPLAZADA_AT:${nowISO()}`,
+    });
+    await appendEvidenceAuditEntry({
+      accion: "REEMPLAZAR",
+      evidencia_id: evidenciaId,
+      external_id: actor.profile.external_id,
+      visita_id: found.evidence.visita_id,
+      tienda_id: (await getVisitById(found.evidence.visita_id))?.tienda_id || "",
+      marca_id: found.evidence.marca_id,
+      tipo_evidencia: found.evidence.tipo_evidencia,
+      fase: found.evidence.fase,
+      foto_nombre_anterior: previousPhotoName,
+      hash_anterior: previousHash,
+      foto_nombre_nueva: fotoNombre,
+      hash_nueva: nextHash,
+      comentario: "Reemplazo de evidencia desde mini app",
     });
     if (upper(found.evidence.tipo_evidencia) !== "ASISTENCIA") {
       scheduleEvidenceGroupAnalysis({
@@ -3080,10 +3181,18 @@ app.post("/miniapp/supervisor/dashboard", async (req, res) => {
       const visit = visitMap[item.visita_id];
       return visit && promotorIds.includes(visit.promotor_id) && ymdInTZ(new Date(item.fecha_hora), APP_TZ) === todayISO() && upper(item.tipo_evidencia) !== "ASISTENCIA";
     }).length;
+    const usageByTeam = team.map((item) => item.external_id).filter(Boolean);
+    const usageRows = (await getEvidenciasAll()).filter((row) => usageByTeam.includes(row.external_id) && upper(row.status) !== "ANULADA" && !!norm(row.url_foto));
+    const usageTodayRows = usageRows.filter((row) => row.fecha_hora && ymdInTZ(new Date(row.fecha_hora), APP_TZ) === todayISO());
+    const usageMonthRows = usageRows.filter((row) => row.fecha_hora && ymdInTZ(new Date(row.fecha_hora), APP_TZ).startsWith(todayISO().slice(0, 7)));
     return res.json({
       ok: true,
       supervisor: { nombre: actor.profile.nombre },
       summary: { promotores: team.length, visitasHoy, abiertas, evidenciasHoy, alertas },
+      usage: {
+        today: summarizeUsageFromRows(usageTodayRows),
+        month: summarizeUsageFromRows(usageMonthRows),
+      },
     });
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message || "supervisor dashboard error" });
@@ -3097,6 +3206,7 @@ app.post("/miniapp/supervisor/team", async (req, res) => {
     const team = await getPromotoresDeSupervisor(actor.profile.external_id);
     const alerts = await getAlertsAll();
     const evidences = await getEvidenciasAll();
+    const tiendaMap = await getTiendaMap();
     const today = todayISO();
     const rows = [];
     for (const member of team) {
@@ -3119,6 +3229,7 @@ app.post("/miniapp/supervisor/team", async (req, res) => {
         evidencias_hoy: evidenciasHoy,
         alertas_abiertas: alertasAbiertas,
         ultima_tienda: latest?.tienda_id || "",
+        ultima_tienda_display: latest ? formatStoreDisplay(latest.tienda_id, tiendaMap[latest.tienda_id]?.nombre_tienda || latest.tienda_id) : "",
         ultima_entrada: latest?.hora_inicio || "",
         ultima_salida: latest?.hora_fin || "",
         ultima_visita_id: latest?.visita_id || "",
@@ -3263,13 +3374,26 @@ app.post("/miniapp/supervisor/visit-expedient", async (req, res) => {
         promotor_nombre: promotorMap[item.promotor_id]?.nombre || item.promotor_id,
         fecha_hora_fmt: fmtDateTimeTZ(item.fecha_hora),
         tienda_nombre: tiendaMap[item.tienda_id]?.nombre_tienda || item.tienda_id,
+        tienda_display: formatStoreDisplay(item.tienda_id, tiendaMap[item.tienda_id]?.nombre_tienda || item.tienda_id),
       }));
+    const grouped = {};
+    for (const item of evidencias.filter((row) => upper(row.status) !== "ANULADA" && upper(row.tipo_evidencia) !== "ASISTENCIA")) {
+      const marca = norm(item.marca_nombre) || norm(item.marca_id) || "Sin marca";
+      const tipo = norm(item.tipo_evidencia) || "Sin tipo";
+      const fase = norm(item.fase || "NA") || "NA";
+      grouped[marca] = grouped[marca] || {};
+      grouped[marca][tipo] = grouped[marca][tipo] || {};
+      grouped[marca][tipo][fase] = (grouped[marca][tipo][fase] || 0) + 1;
+    }
     const visitPayload = {
       ...visit,
       tienda_nombre: tiendaMap[visit.tienda_id]?.nombre_tienda || visit.tienda_id,
+      tienda_display: formatStoreDisplay(visit.tienda_id, tiendaMap[visit.tienda_id]?.nombre_tienda || visit.tienda_id),
       promotor_nombre: promotorMap[visit.promotor_id]?.nombre || visit.promotor_id,
+      duracion_minutos: calcVisitDurationMinutes(visit.hora_inicio, visit.hora_fin),
+      duracion_fmt: fmtVisitDuration(visit.hora_inicio, visit.hora_fin),
     };
-    return res.json({ ok: true, visita: visitPayload, evidencias, alertas });
+    return res.json({ ok: true, visita: visitPayload, evidencias, alertas, resumen: { total_evidencias: evidencias.filter((row) => upper(row.tipo_evidencia) !== "ASISTENCIA" && upper(row.status) !== "ANULADA").length, total_alertas: alertas.length, por_marca_tipo_fase: grouped } });
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message || "visit expedient error" });
   }
