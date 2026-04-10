@@ -1259,6 +1259,58 @@ async function getEvidenciasByVisitId(visitaId) {
   return all.filter((row) => row.visita_id === visitaId);
 }
 
+async function validateBeforeAfterClose(visitaId) {
+  const evidences = await getEvidenciasByVisitId(visitaId);
+  const activeOperational = evidences.filter((item) => upper(item.status) !== "ANULADA" && upper(item.tipo_evidencia) !== "ASISTENCIA");
+  if (!activeOperational.length) return { ok: true, missing: [] };
+
+  const marcaMap = await getMarcaMap();
+  const grouped = new Map();
+
+  for (const item of activeOperational) {
+    const brandId = norm(item.marca_id);
+    const typeKey = evidenceTypeKey(item.tipo_evidencia);
+    if (!brandId || !typeKey) continue;
+    const phase = upper(item.fase || "NA");
+    const key = `${brandId}::${typeKey}`;
+    if (!grouped.has(key)) {
+      grouped.set(key, {
+        marca_id: brandId,
+        marca_nombre: marcaMap[brandId]?.marca_nombre || brandId,
+        tipo_evidencia: canonicalEvidenceTypeLabel(item.tipo_evidencia),
+        antes: 0,
+        despues: 0,
+      });
+    }
+    const bucket = grouped.get(key);
+    if (phase === "ANTES") bucket.antes += 1;
+    if (phase === "DESPUES") bucket.despues += 1;
+  }
+
+  const brandRulesCache = new Map();
+  const missing = [];
+  for (const bucket of grouped.values()) {
+    if (bucket.antes <= 0) continue;
+    if (!brandRulesCache.has(bucket.marca_id)) {
+      brandRulesCache.set(bucket.marca_id, await getReglasPorMarca(bucket.marca_id));
+    }
+    const rules = brandRulesCache.get(bucket.marca_id) || [];
+    const rule = rules.find((row) => evidenceTypeKey(row.tipo_evidencia) === evidenceTypeKey(bucket.tipo_evidencia));
+    if (!rule?.requiere_antes_despues) continue;
+    if (bucket.despues <= 0) {
+      missing.push({
+        marca_id: bucket.marca_id,
+        marca_nombre: bucket.marca_nombre,
+        tipo_evidencia: bucket.tipo_evidencia,
+        antes: bucket.antes,
+        despues: bucket.despues,
+      });
+    }
+  }
+
+  return { ok: !missing.length, missing };
+}
+
 async function registrarEvidencia(payload) {
   const result = await registrarEvidenciasBatch([payload]);
   return { photoOverflow: result.photoOverflow, originalPhotoLength: result.maxOriginalPhotoLength || 0 };
@@ -3089,6 +3141,16 @@ app.post("/miniapp/promotor/close-visit", async (req, res) => {
     if (!fotoDataUrl) return res.status(400).json({ ok: false, error: "foto requerida" });
     const visit = await getVisitById(visitaId);
     if (!visit || visit.promotor_id !== actor.profile.promotor_id) return res.status(404).json({ ok: false, error: "Visita no encontrada" });
+
+    const beforeAfterCheck = await validateBeforeAfterClose(visitaId);
+    if (!beforeAfterCheck.ok) {
+      const lines = beforeAfterCheck.missing.map((item) => `• ${item.marca_nombre} · ${item.tipo_evidencia}: falta al menos una foto DESPUES`);
+      return res.status(400).json({
+        ok: false,
+        error: `No puedes registrar salida todavía. Faltan fotos DESPUES para completar evidencias ANTES en: ${lines.join(" | ")}`,
+        missing_after: beforeAfterCheck.missing,
+      });
+    }
 
     const geofence = await buildGeofenceContext(visit.tienda_id, lat, lon, accuracy);
     await closeVisitWithGeofence(visit, "Registro de salida", geofence);
