@@ -3432,7 +3432,7 @@ app.post("/miniapp/supervisor/promotor-visits-today", async (req, res) => {
   }
 });
 
-app.post("/miniapp/promotor/alerts-recent"app.post("/miniapp/promotor/alerts-recent", async (req, res) => {
+app.post("/miniapp/promotor/alerts-recent", async (req, res) => {
   try {
     const { actor } = await getActorFromRequest(req);
     if (actor.role !== "promotor") return res.status(403).json({ ok: false, error: "Solo promotor" });
