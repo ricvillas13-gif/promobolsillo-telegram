@@ -3407,20 +3407,33 @@ app.post("/miniapp/supervisor/day-route", async (req, res) => {
     const fecha = norm(req.body?.fecha || todayISO());
     const team = await getPromotoresDeSupervisor(actor.profile.external_id);
     const promotorIds = new Set(team.map((item) => item.promotor_id));
-    if (promotorId && !promotorIds.has(promotorId)) return res.status(403).json({ ok: false, error: "No autorizado" });
-    const targets = promotorId ? [promotorId] : Array.from(promotorIds);
-    const rows = [];
-    for (const id of targets) {
-      const routeRows = await buildDayRouteRowsForPromotor(id, fecha);
-      rows.push(...routeRows.map((item) => ({ ...item, promotor_id: id })));
-    }
-    return res.json({ ok: true, rows });
+    if (!promotorId) return res.status(400).json({ ok: false, error: "promotor_id requerido" });
+    if (!promotorIds.has(promotorId)) return res.status(403).json({ ok: false, error: "No autorizado" });
+    const rows = await buildDayRouteRowsForPromotor(promotorId, fecha);
+    return res.json({ ok: true, promotor_id: promotorId, fecha, rows });
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message || "day-route error" });
   }
 });
 
-app.post("/miniapp/promotor/alerts-recent", async (req, res) => {
+app.post("/miniapp/supervisor/promotor-visits-today", async (req, res) => {
+  try {
+    const { actor } = await getActorFromRequest(req);
+    if (actor.role !== "supervisor") return res.status(403).json({ ok: false, error: "Solo supervisor" });
+    const promotorId = norm(req.body?.promotor_id);
+    const fecha = norm(req.body?.fecha || todayISO());
+    const team = await getPromotoresDeSupervisor(actor.profile.external_id);
+    const promotorIds = new Set(team.map((item) => item.promotor_id));
+    if (!promotorId) return res.status(400).json({ ok: false, error: "promotor_id requerido" });
+    if (!promotorIds.has(promotorId)) return res.status(403).json({ ok: false, error: "No autorizado" });
+    const rows = await buildDayRouteRowsForPromotor(promotorId, fecha);
+    return res.json({ ok: true, promotor_id: promotorId, fecha, rows });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message || "promotor-visits-today error" });
+  }
+});
+
+app.post("/miniapp/promotor/alerts-recent"app.post("/miniapp/promotor/alerts-recent", async (req, res) => {
   try {
     const { actor } = await getActorFromRequest(req);
     if (actor.role !== "promotor") return res.status(403).json({ ok: false, error: "Solo promotor" });
