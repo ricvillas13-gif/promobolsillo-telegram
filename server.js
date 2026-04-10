@@ -26,6 +26,14 @@ const EVPLUS_MIN_DIMENSION = 420;
 const EVPLUS_MIN_ESTIMATED_BYTES = 9000;
 const PHOTO_CELL_LIMIT = 48000;
 const pendingEvidenceAnalysisTimers = new Map();
+const pendingVisitTaskRecalcTimers = new Map();
+const SHEET_READ_CACHE_DEFAULT_TTL_MS = 45000;
+const SHEET_READ_CACHE_FAST_TTL_MS = 12000;
+const SHEET_READ_CACHE_SLOW_TTL_MS = 180000;
+const ACTOR_CACHE_TTL_MS = 60000;
+const sheetReadCache = new Map();
+const sheetReadInflight = new Map();
+const actorCache = new Map();
 
 const ALLOWED_ORIGINS = [MINIAPP_BASE_URL, PUBLIC_BASE_URL, "http://localhost:5173", "https://localhost:5173"].filter(Boolean);
 
@@ -384,11 +392,99 @@ async function getActorFromRequest(req) {
   const initData = norm(req.body?.initData || req.headers["x-telegram-init-data"] || "");
   if (!initData) throw new Error("initData requerido");
   const validated = verifyTelegramInitData(initData);
-  const actor = await resolveActor(validated.external_id);
+  const actor = await resolveActorCached(validated.external_id);
   return { validated, actor };
 }
 
+
 let sheetsClient = null;
+
+function clone2dValues(values) {
+  return (values || []).map((row) => (Array.isArray(row) ? [...row] : row));
+}
+
+function cloneJson(value) {
+  return value == null ? value : JSON.parse(JSON.stringify(value));
+}
+
+function sheetNameFromRange(range = "") {
+  const raw = norm(String(range).split("!")[0]);
+  return raw.replace(/^'/, "").replace(/'$/, "");
+}
+
+function getSheetCacheTtlMs(range = "") {
+  const sheetName = sheetNameFromRange(range);
+  if (["SESIONES", "VISITAS", "EVIDENCIAS", "ALERTAS"].includes(sheetName)) return SHEET_READ_CACHE_FAST_TTL_MS;
+  if (["PROMOTORES", "SUPERVISORES", "ACCESOS_CLIENTE", "CLIENTES", "TIENDAS", "MARCAS", "TIPOS_EVIDENCIA", "REGLAS_EVIDENCIA", "TIENDA_MARCAS"].includes(sheetName)) {
+    return SHEET_READ_CACHE_SLOW_TTL_MS;
+  }
+  return SHEET_READ_CACHE_DEFAULT_TTL_MS;
+}
+
+function readSheetCache(range) {
+  const cached = sheetReadCache.get(range);
+  if (!cached) return null;
+  if (cached.expiresAt <= Date.now()) {
+    sheetReadCache.delete(range);
+    return null;
+  }
+  return clone2dValues(cached.values);
+}
+
+function writeSheetCache(range, values) {
+  sheetReadCache.set(range, {
+    values: clone2dValues(values),
+    expiresAt: Date.now() + getSheetCacheTtlMs(range),
+  });
+}
+
+function invalidateSheetCache(sheetNameOrRange = "") {
+  const sheetName = sheetNameFromRange(sheetNameOrRange);
+  if (!sheetName) {
+    sheetReadCache.clear();
+    return;
+  }
+  for (const key of Array.from(sheetReadCache.keys())) {
+    if (sheetNameFromRange(key) === sheetName) sheetReadCache.delete(key);
+  }
+}
+
+function isQuotaExceededError(error) {
+  const pieces = [
+    error?.message,
+    error?.response?.data?.error?.message,
+    Array.isArray(error?.errors) ? error.errors.map((item) => item?.message).join(" | ") : "",
+  ].filter(Boolean).join(" | ").toLowerCase();
+  return pieces.includes("quota exceeded") || pieces.includes("read requests per minute per user");
+}
+
+function buildFriendlySheetsError(error, range = "") {
+  if (isQuotaExceededError(error)) {
+    const friendly = new Error("Servicio temporalmente saturado por límite temporal de Google Sheets. Espera 30 a 60 segundos y vuelve a intentar.");
+    friendly.statusCode = 503;
+    friendly.isQuotaExceeded = true;
+    friendly.range = range;
+    return friendly;
+  }
+  return error;
+}
+
+function readActorCache(externalId) {
+  const cached = actorCache.get(externalId);
+  if (!cached) return null;
+  if (cached.expiresAt <= Date.now()) {
+    actorCache.delete(externalId);
+    return null;
+  }
+  return cloneJson(cached.value);
+}
+
+function writeActorCache(externalId, value) {
+  actorCache.set(externalId, {
+    value: cloneJson(value),
+    expiresAt: Date.now() + ACTOR_CACHE_TTL_MS,
+  });
+}
 
 async function getSheetsClient() {
   if (sheetsClient) return sheetsClient;
@@ -402,10 +498,30 @@ async function getSheetsClient() {
   return sheetsClient;
 }
 
-async function getSheetValues(range) {
-  const sheets = await getSheetsClient();
-  const res = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range });
-  return res.data.values || [];
+async function getSheetValues(range, options = {}) {
+  const useCache = options.useCache !== false;
+  if (useCache) {
+    const cached = readSheetCache(range);
+    if (cached) return cached;
+  }
+  if (useCache && sheetReadInflight.has(range)) {
+    return clone2dValues(await sheetReadInflight.get(range));
+  }
+  const loader = (async () => {
+    try {
+      const sheets = await getSheetsClient();
+      const res = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range });
+      const values = res.data.values || [];
+      if (useCache) writeSheetCache(range, values);
+      return clone2dValues(values);
+    } catch (error) {
+      throw buildFriendlySheetsError(error, range);
+    } finally {
+      if (useCache) sheetReadInflight.delete(range);
+    }
+  })();
+  if (useCache) sheetReadInflight.set(range, loader);
+  return clone2dValues(await loader);
 }
 
 async function appendSheetValues(range, values) {
@@ -416,6 +532,7 @@ async function appendSheetValues(range, values) {
     valueInputOption: "USER_ENTERED",
     requestBody: { values },
   });
+  invalidateSheetCache(range);
 }
 
 async function updateSheetValues(range, values) {
@@ -426,11 +543,17 @@ async function updateSheetValues(range, values) {
     valueInputOption: "USER_ENTERED",
     requestBody: { values },
   });
+  invalidateSheetCache(range);
 }
 
 async function getSheetHeader(sheetName) {
-  const values = await getSheetValues(`${sheetName}!1:1`);
-  return (values[0] || []).map((v) => norm(v));
+  try {
+    const values = await getSheetValues(`${sheetName}!1:1`);
+    return (values[0] || []).map((v) => norm(v));
+  } catch (error) {
+    if (error?.isQuotaExceeded) throw error;
+    throw new Error(`No se pudo leer la hoja ${sheetName}. Verifica que exista y que el nombre sea exacto.`);
+  }
 }
 
 async function getPolicyValidation() {
@@ -656,6 +779,14 @@ async function resolveActor(externalId) {
       nombre: "Usuario",
     },
   };
+}
+
+async function resolveActorCached(externalId) {
+  const cached = readActorCache(externalId);
+  if (cached) return cached;
+  const resolved = await resolveActor(externalId);
+  writeActorCache(externalId, resolved);
+  return resolved;
 }
 
 async function findSessionRow(externalId) {
@@ -2086,6 +2217,27 @@ async function rerunEvidencePlusForGroup(visitaId, marcaId, tipoEvidencia, fase)
   }
 }
 
+
+
+function scheduleVisitTaskRecalculation(visitaId) {
+  const key = norm(visitaId);
+  if (!key) return;
+  const existing = pendingVisitTaskRecalcTimers.get(key);
+  if (existing) clearTimeout(existing);
+  const timer = setTimeout(async () => {
+    pendingVisitTaskRecalcTimers.delete(key);
+    try {
+      await recalculateTareasForVisita(key);
+    } catch (error) {
+      console.warn("scheduleVisitTaskRecalculation error", {
+        visitaId: key,
+        message: error?.message || error,
+      });
+    }
+  }, 3000);
+  pendingVisitTaskRecalcTimers.set(key, timer);
+}
+
 async function buildGeofenceContext(tiendaId, lat, lon, accuracy) {
   const tiendaMap = await getTiendaMap();
   const policy = await getPolicyValidation();
@@ -2731,7 +2883,8 @@ app.post("/miniapp/bootstrap", async (req, res) => {
       },
     });
   } catch (error) {
-    return res.status(401).json({ ok: false, error: error.message || "auth failed" });
+    const statusCode = error?.isQuotaExceeded ? 503 : 401;
+    return res.status(statusCode).json({ ok: false, error: error.message || "auth failed" });
   }
 });
 
@@ -2991,6 +3144,7 @@ app.post("/miniapp/promotor/close-visit", async (req, res) => {
   }
 });
 
+
 app.post("/miniapp/promotor/evidence-register", async (req, res) => {
   try {
     const { actor } = await getActorFromRequest(req);
@@ -3051,9 +3205,15 @@ app.post("/miniapp/promotor/evidence-register", async (req, res) => {
     });
 
     const batchResult = await registrarEvidenciasBatch(batchPayloads);
+    const warnings = [];
 
-    scheduleEvidenceGroupAnalysis({ visitaId, marcaId, tipoEvidencia, fase });
-    await recalculateTareasForVisita(visitaId);
+    try {
+      scheduleEvidenceGroupAnalysis({ visitaId, marcaId, tipoEvidencia, fase });
+      scheduleVisitTaskRecalculation(visitaId);
+    } catch (postprocessError) {
+      console.warn("evidence-register postprocess warning", postprocessError?.message || postprocessError);
+      warnings.push(postprocessError?.message || "postprocess_warning");
+    }
 
     return res.json({
       ok: true,
@@ -3062,10 +3222,12 @@ app.post("/miniapp/promotor/evidence-register", async (req, res) => {
       count: created.length,
       warning: batchResult.photoOverflow ? "evidence_photo_too_large_for_sheets" : undefined,
       analysis_status: "scheduled",
+      postprocess_warning: warnings[0] || undefined,
     });
   } catch (error) {
     console.error("evidence-register error", error);
-    return res.status(500).json({ ok: false, error: error.message || "No se pudo registrar la evidencia." });
+    const statusCode = error?.isQuotaExceeded ? 503 : 500;
+    return res.status(statusCode).json({ ok: false, error: error.message || "No se pudo registrar la evidencia." });
   }
 });
 
