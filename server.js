@@ -987,8 +987,7 @@ async function notifySupervisorAlert(payload) {
       evidencia?.tipo_evidencia ? `Evidencia: *${evidencia.tipo_evidencia}*` : "",
       evidencia?.fase && upper(evidencia.fase) !== "NA" ? `Fase: *${evidencia.fase}*` : "",
       payload.descripcion ? `Detalle: ${payload.descripcion}` : "",
-    ].filter(Boolean).join("
-");
+    ].filter(Boolean).join("\n");
     const markup = { inline_keyboard: [[{ text: "Abrir panel", web_app: { url: getMiniAppUrl() } }]] };
     if (evidencia?.url_foto && evidencia.url_foto !== "[IMAGE_TOO_LARGE_FOR_SHEETS]") {
       try {
