@@ -1002,6 +1002,25 @@ async function closeVisitWithGeofence(visit, closeNotes, geofence) {
   }
   const row = buildVisitRowFromHeader(header, payload);
   await updateSheetValues(`VISITAS!A${visit.rowIndex}:${headerRangeEnd(header.length)}${visit.rowIndex}`, [row]);
+
+async function closeVisitWithoutExitCapture(visit, closeNotes) {
+  const header = await getVisitsHeader();
+  const payload = {
+    ...visit,
+    hora_fin: nowISO(),
+    notas: closeNotes || visit.notas,
+    estado_visita: upper(visit.resultado_geocerca_entrada) === "FUERA_DE_GEOCERCA" ? "CERRADA_CON_ALERTA" : "CERRADA",
+    resultado_geocerca_salida: visit.resultado_geocerca_salida || "",
+    distancia_salida_m: visit.distancia_salida_m || "",
+    accuracy_salida_m: visit.accuracy_salida_m || "",
+    lat_tienda: visit.lat_tienda || "",
+    lon_tienda: visit.lon_tienda || "",
+    radio_tienda_m: visit.radio_tienda_m || "",
+  };
+  const row = buildVisitRowFromHeader(header, payload);
+  await updateSheetValues(`VISITAS!A${visit.rowIndex}:${headerRangeEnd(header.length)}${visit.rowIndex}`, [row]);
+}
+
 }
 
 async function getAlertsHeader() {
@@ -1259,6 +1278,22 @@ async function getEvidenciasByVisitId(visitaId) {
   return all.filter((row) => row.visita_id === visitaId);
 }
 
+function buildEvidenceMapById(evidences = []) {
+  const map = {};
+  for (const item of evidences || []) {
+    if (item?.evidencia_id) map[item.evidencia_id] = item;
+  }
+  return map;
+}
+
+function isAlertVisibleWithEvidence(alert, evidenceMap = {}) {
+  if (!norm(alert?.evidencia_id)) return true;
+  const evidence = evidenceMap[norm(alert.evidencia_id)];
+  if (!evidence) return true;
+  return upper(evidence.status) !== "ANULADA";
+}
+
+
 async function validateBeforeAfterClose(visitaId) {
   const evidences = await getEvidenciasByVisitId(visitaId);
   const activeOperational = evidences.filter((item) => upper(item.status) !== "ANULADA" && upper(item.tipo_evidencia) !== "ASISTENCIA");
@@ -1436,21 +1471,29 @@ async function getTiposEvidenciaCatalog() {
 }
 
 async function getReglasPorMarca(marcaId) {
+  const catalog = await getTiposEvidenciaCatalog();
+  const catalogByType = new Map(catalog.map((item, idx) => [evidenceTypeKey(item.tipo_evidencia), { ...item, orden_catalogo: idx + 1 }]));
   try {
     const rows = await getSheetValues("REGLAS_EVIDENCIA!A2:H");
     const rules = rows
       .filter((row) => norm(row[0]) === marcaId && (row.length < 5 || isTrue(row[4] ?? "TRUE")))
-      .map((row, idx) => ({
-        marca_id: marcaId,
-        tipo_evidencia: canonicalEvidenceTypeLabel(row[1]),
-        fotos_requeridas: safeInt(row[2], 1),
-        requiere_antes_despues: isTrue(row[3]),
-        activa: row.length < 5 || isTrue(row[4] ?? "TRUE"),
-        orden: safeInt(row[5], idx + 1),
-        obligatoria: row.length >= 7 ? isTrue(row[6]) : true,
-        observaciones: norm(row[7]),
-        origen: "REGLAS_EVIDENCIA",
-      }))
+      .map((row, idx) => {
+        const tipo = canonicalEvidenceTypeLabel(row[1]);
+        const key = evidenceTypeKey(tipo);
+        const catalogInfo = catalogByType.get(key) || {};
+        return {
+          marca_id: marcaId,
+          tipo_evidencia: tipo,
+          fotos_requeridas: safeInt(row[2], catalogInfo.fotos_requeridas || 1),
+          requiere_antes_despues: isTrue(row[3]),
+          activa: row.length < 5 || isTrue(row[4] ?? "TRUE"),
+          orden: safeInt(row[5], catalogInfo.orden_catalogo || idx + 1),
+          obligatoria: row.length >= 7 ? isTrue(row[6]) : (catalogInfo.obligatoria ?? true),
+          observaciones: norm(row[7]),
+          descripcion_corta: catalogInfo.descripcion_corta || "",
+          origen: "REGLAS_EVIDENCIA",
+        };
+      })
       .filter((rule) => !!rule.tipo_evidencia);
 
     const seen = new Set();
@@ -1948,17 +1991,18 @@ async function getPendingCloseStatsForSupervisor(supervisorExternalId) {
   const team = await getPromotoresDeSupervisor(supervisorExternalId);
   const promotorIds = new Set(team.map((item) => item.promotor_id));
   const alerts = await getAlertsAll();
-  const openAlerts = alerts.filter((item) => promotorIds.has(item.promotor_id) && upper(item.status || "ABIERTA") === "ABIERTA").length;
+  const evidences = await getEvidenciasAll();
+  const evidenceMap = buildEvidenceMapById(evidences);
+  const openAlerts = alerts.filter((item) => promotorIds.has(item.promotor_id) && upper(item.status || "ABIERTA") === "ABIERTA" && isAlertVisibleWithEvidence(item, evidenceMap)).length;
   let openVisits = 0;
   for (const item of team) {
     const visits = await getVisitasToday(item.promotor_id);
     openVisits += visits.filter((v) => !v.hora_fin).length;
   }
   const visitMap = await getAllVisitsMap();
-  const evidences = await getEvidenciasAll();
   const pendingReviews = evidences.filter((item) => {
     const visit = visitMap[item.visita_id];
-    return visit && promotorIds.has(visit.promotor_id) && upper(item.tipo_evidencia) !== "ASISTENCIA" && (isTrue(item.requiere_revision_supervisor) || upper(item.status) === "PENDIENTE_REVISION");
+    return visit && promotorIds.has(visit.promotor_id) && upper(item.tipo_evidencia) !== "ASISTENCIA" && upper(item.status) !== "ANULADA" && (isTrue(item.requiere_revision_supervisor) || upper(item.status) === "PENDIENTE_REVISION");
   }).length;
   return {
     open_visits: openVisits,
@@ -1972,10 +2016,11 @@ async function buildDayRouteRowsForPromotor(promotorId, dateYmd) {
   const marcaMap = await getMarcaMap();
   const visits = (await getVisitasToday(promotorId)).filter((visit) => !dateYmd || visit.fecha === dateYmd);
   const alerts = await getAlertsAll();
+  const evidenceMap = buildEvidenceMapById(await getEvidenciasAll());
   const rows = [];
   for (const visit of visits.sort((a, b) => String(a.hora_inicio).localeCompare(String(b.hora_inicio)))) {
     const evidencias = await getEvidenciasByVisitId(visit.visita_id);
-    const alertas = alerts.filter((item) => item.visita_id === visit.visita_id);
+    const alertas = alerts.filter((item) => item.visita_id === visit.visita_id && isAlertVisibleWithEvidence(item, evidenceMap));
     rows.push({
       visita_id: visit.visita_id,
       tienda_id: visit.tienda_id,
@@ -3063,6 +3108,17 @@ app.post("/miniapp/promotor/start-entry", async (req, res) => {
     if (!tiendaId) return res.status(400).json({ ok: false, error: "tienda_id requerido" });
     if (!fotoDataUrl) return res.status(400).json({ ok: false, error: "foto requerida" });
 
+    const tiendaMap = await getTiendaMap();
+    const existingOpenVisit = (await getOpenVisitsToday(actor.profile.promotor_id)).find((item) => item.tienda_id === tiendaId);
+    if (existingOpenVisit) {
+      return res.status(409).json({
+        ok: false,
+        error: `Ya tienes una visita abierta en ${getStoreDisplayNameById(tiendaId, tiendaMap)}. Debes registrar salida antes de volver a abrirla.`,
+        visita_id: existingOpenVisit.visita_id,
+        tienda_id: tiendaId,
+      });
+    }
+
     const geofence = await buildGeofenceContext(tiendaId, lat, lon, accuracy);
     const planRow = await findPlaneacionForVisit(todayISO(), actor.profile.promotor_id, tiendaId);
     const visitId = await createVisitWithGeofence(actor.profile.promotor_id, tiendaId, "Registro de entrada", geofence);
@@ -3109,6 +3165,7 @@ app.post("/miniapp/promotor/start-entry", async (req, res) => {
       visita_id: visitId,
       tienda_id: tiendaId,
       tienda_nombre: geofence.tienda?.nombre_tienda || tiendaId,
+      tienda_display: getStoreDisplayNameById(tiendaId, tiendaMap),
       started_at: nowISO(),
       warning: attendanceResult.photoOverflow ? "attendance_photo_too_large_for_sheets" : undefined,
       plan_status: planRow ? (isVisitValidForPlan({ resultado_geocerca_entrada: geofence.resultado }) ? "VISITADA" : "PLANEADA") : "SIN_PLANEACION",
@@ -3124,73 +3181,35 @@ app.post("/miniapp/promotor/close-visit", async (req, res) => {
     const { actor } = await getActorFromRequest(req);
     if (actor.role !== "promotor") return res.status(403).json({ ok: false, error: "Solo promotor" });
     const visitaId = norm(req.body?.visita_id);
-    const lat = safeNum(req.body?.lat, NaN);
-    const lon = safeNum(req.body?.lon, NaN);
-    const accuracy = safeNum(req.body?.accuracy, 0);
-    const fotoNombre = norm(req.body?.foto_nombre || "salida.jpg");
-    const fotoDataUrl = norm(req.body?.foto_data_url);
     if (!visitaId) return res.status(400).json({ ok: false, error: "visita_id requerido" });
-    if (!fotoDataUrl) return res.status(400).json({ ok: false, error: "foto requerida" });
     const visit = await getVisitById(visitaId);
     if (!visit || visit.promotor_id !== actor.profile.promotor_id) return res.status(404).json({ ok: false, error: "Visita no encontrada" });
 
     const beforeAfterCheck = await validateBeforeAfterClose(visitaId);
     if (!beforeAfterCheck.ok) {
-      const lines = beforeAfterCheck.missing.map((item) => `• ${item.marca_nombre} · ${item.tipo_evidencia}: falta al menos una foto DESPUES`);
-      return res.status(400).json({
+      const lines = [];
+      const seen = new Set();
+      for (const item of beforeAfterCheck.missing) {
+        const label = item.tipo_evidencia ? `${item.marca_nombre} (${item.tipo_evidencia})` : item.marca_nombre;
+        if (seen.has(label)) continue;
+        seen.add(label);
+        lines.push(label);
+      }
+      return res.status(409).json({
         ok: false,
-        error: `No puedes registrar salida todavía. Faltan fotos DESPUES para completar evidencias ANTES en: ${lines.join(" | ")}`,
+        error: `No puedes registrar salida todavía. Debes registrar al menos 1 foto DESPUES para: ${lines.join(" | ")}`,
         missing_after: beforeAfterCheck.missing,
       });
     }
 
-    const geofence = await buildGeofenceContext(visit.tienda_id, lat, lon, accuracy);
-    await closeVisitWithGeofence(visit, "Registro de salida", geofence);
-    const evidenceId = `EV-${Date.now()}-ASIS-OUT`;
-    const attendanceResult = await registrarEvidencia({
-      evidencia_id: evidenceId,
-      external_id: actor.profile.external_id,
-      fecha_hora: nowISO(),
-      tipo_evento: "ASISTENCIA_SALIDA",
-      origen: "ASISTENCIA",
-      jornada_id: "",
-      visita_id: visitaId,
-      url_foto: fotoDataUrl,
-      lat: String(lat),
-      lon: String(lon),
-      resultado_ai: "Salida validada (demo)",
-      score_confianza: geofence.resultado === "FUERA_DE_GEOCERCA" ? "0.72" : "0.93",
-      riesgo: geofence.resultado === "FUERA_DE_GEOCERCA" ? "ALTO" : "BAJO",
-      marca_id: "",
-      producto_id: "",
-      tipo_evidencia: "ASISTENCIA",
-      descripcion: "[TELEGRAM_MINIAPP_SALIDA]",
-      status: "ACTIVA",
-      note: "",
-      fase: "NA",
-      foto_nombre: fotoNombre,
-      accuracy: String(accuracy || ""),
-      hallazgos_ai: "",
-      reglas_disparadas: "",
-      analizado_at: "",
-      version_motor_ai: "",
-      hash_foto: buildEvidencePhotoHash(fotoDataUrl, fotoNombre),
-    });
-    if (upper(geofence.resultado) === "FUERA_DE_GEOCERCA") {
-      await createGeofenceAlertIfNeeded(visitaId, actor.profile, visit.tienda_id, "GEOCERCA_SALIDA", geofence, evidenceId);
-    }
-    return res.json({
-      ok: true,
-      visita_id: visitaId,
-      closed_at: nowISO(),
-      warning: attendanceResult.photoOverflow ? "attendance_photo_too_large_for_sheets" : undefined,
-    });
+    await closeVisitWithoutExitCapture(visit, "Registro de salida");
+    if (!visit.hora_fin) scheduleVisitTaskRecalculation(visitaId);
+    return res.json({ ok: true, visita_id: visitaId, closed_at: nowISO() });
   } catch (error) {
     console.error("close-visit error", error);
     return res.status(500).json({ ok: false, error: error.message || "No se pudo registrar la salida real." });
   }
 });
-
 
 app.post("/miniapp/promotor/evidence-register", async (req, res) => {
   try {
@@ -3374,12 +3393,13 @@ app.post("/miniapp/supervisor/dashboard", async (req, res) => {
       abiertas += visits.filter((v) => !v.hora_fin).length;
     }
     const allAlerts = await getAlertsAll();
-    const alertas = allAlerts.filter((alert) => promotorIds.includes(alert.promotor_id) && upper(alert.status || "ABIERTA") === "ABIERTA").length;
     const allEvidences = await getEvidenciasAll();
+    const evidenceMap = buildEvidenceMapById(allEvidences);
+    const alertas = allAlerts.filter((alert) => promotorIds.includes(alert.promotor_id) && upper(alert.status || "ABIERTA") === "ABIERTA" && isAlertVisibleWithEvidence(alert, evidenceMap)).length;
     const visitMap = await getAllVisitsMap();
     const evidenciasHoy = allEvidences.filter((item) => {
       const visit = visitMap[item.visita_id];
-      return visit && promotorIds.includes(visit.promotor_id) && ymdInTZ(new Date(item.fecha_hora), APP_TZ) === todayISO() && upper(item.tipo_evidencia) !== "ASISTENCIA";
+      return visit && promotorIds.includes(visit.promotor_id) && ymdInTZ(new Date(item.fecha_hora), APP_TZ) === todayISO() && upper(item.tipo_evidencia) !== "ASISTENCIA" && upper(item.status) !== "ANULADA";
     }).length;
     const usage = await getSupervisorUsageStats(actor.profile.external_id);
     const pending_close = await getPendingCloseStatsForSupervisor(actor.profile.external_id);
@@ -3402,6 +3422,7 @@ app.post("/miniapp/supervisor/team", async (req, res) => {
     const team = await getPromotoresDeSupervisor(actor.profile.external_id);
     const alerts = await getAlertsAll();
     const evidences = await getEvidenciasAll();
+    const evidenceMap = buildEvidenceMapById(evidences);
     const tiendaMap = await getTiendaMap();
     const today = todayISO();
     const rows = [];
@@ -3409,8 +3430,8 @@ app.post("/miniapp/supervisor/team", async (req, res) => {
       const visits = await getVisitasToday(member.promotor_id);
       const openVisits = visits.filter((v) => !v.hora_fin);
       const latest = visits.slice().sort((a, b) => String(b.hora_inicio).localeCompare(String(a.hora_inicio)))[0] || null;
-      const evidenciasHoy = evidences.filter((e) => e.visita_id && visits.some((v) => v.visita_id === e.visita_id) && ymdInTZ(new Date(e.fecha_hora), APP_TZ) === today && upper(e.tipo_evidencia) !== "ASISTENCIA").length;
-      const alertasAbiertas = alerts.filter((a) => a.promotor_id === member.promotor_id && upper(a.status || "ABIERTA") === "ABIERTA").length;
+      const evidenciasHoy = evidences.filter((e) => e.visita_id && visits.some((v) => v.visita_id === e.visita_id) && ymdInTZ(new Date(e.fecha_hora), APP_TZ) === today && upper(e.tipo_evidencia) !== "ASISTENCIA" && upper(e.status) !== "ANULADA").length;
+      const alertasAbiertas = alerts.filter((a) => a.promotor_id === member.promotor_id && upper(a.status || "ABIERTA") === "ABIERTA" && isAlertVisibleWithEvidence(a, evidenceMap)).length;
       let statusGeneral = "SIN_MOVIMIENTO";
       if (alertasAbiertas > 0) statusGeneral = "ALERTA";
       else if (openVisits.length > 0) statusGeneral = "ACTIVO";
@@ -3449,10 +3470,12 @@ app.post("/miniapp/supervisor/alerts", async (req, res) => {
     const promotorIds = new Set(team.map((item) => item.promotor_id));
     const promotorMap = await getPromotorMap();
     const tiendaMap = await getTiendaMap();
+    const allEvidences = await getEvidenciasAll();
+    const evidenceMap = buildEvidenceMapById(allEvidences);
     const statusFilter = upper(req.body?.status);
     const severityFilter = upper(req.body?.severidad);
     const promotorFilter = norm(req.body?.promotor_id);
-    let alerts = (await getAlertsAll()).filter((item) => promotorIds.has(item.promotor_id));
+    let alerts = (await getAlertsAll()).filter((item) => promotorIds.has(item.promotor_id) && isAlertVisibleWithEvidence(item, evidenceMap));
     if (statusFilter) alerts = alerts.filter((item) => upper(item.status) === statusFilter);
     if (severityFilter) alerts = alerts.filter((item) => upper(item.severidad) === severityFilter);
     if (promotorFilter) alerts = alerts.filter((item) => item.promotor_id === promotorFilter);
@@ -3521,7 +3544,7 @@ app.post("/miniapp/supervisor/evidences", async (req, res) => {
     const visitMap = await getAllVisitsMap();
     const tiendaMap = await getTiendaMap();
     const promotorMap = await getPromotorMap();
-    let evidences = (await getEvidenciasAll()).filter((item) => upper(item.tipo_evidencia) !== "ASISTENCIA" && promotorIds.has(visitMap[item.visita_id]?.promotor_id));
+    let evidences = (await getEvidenciasAll()).filter((item) => upper(item.tipo_evidencia) !== "ASISTENCIA" && upper(item.status) !== "ANULADA" && promotorIds.has(visitMap[item.visita_id]?.promotor_id));
     const promotorFilter = norm(req.body?.promotor_id);
     const tiendaFilter = norm(req.body?.tienda_id);
     const marcaFilter = norm(req.body?.marca_id);
@@ -3582,9 +3605,10 @@ app.post("/miniapp/supervisor/visit-expedient", async (req, res) => {
     const tiendaMap = await getTiendaMap();
     const promotorMap = await getPromotorMap();
     const evidenciasRaw = await getEvidenciasByVisitId(visitaId);
+    const evidenceMap = buildEvidenceMapById(evidenciasRaw);
     const evidencias = evidenciasRaw.map((item) => buildEvidenceView(item, marcaMap, visitMap, tiendaMap, promotorMap));
     const alertas = (await getAlertsAll())
-      .filter((item) => item.visita_id === visitaId)
+      .filter((item) => item.visita_id === visitaId && isAlertVisibleWithEvidence(item, evidenceMap))
       .map((item) => ({
         ...item,
         promotor_nombre: promotorMap[item.promotor_id]?.nombre || item.promotor_id,
@@ -3601,7 +3625,7 @@ app.post("/miniapp/supervisor/visit-expedient", async (req, res) => {
       entry_fmt: fmtDateTimeTZ(visit.hora_inicio),
       exit_fmt: visit.hora_fin ? fmtDateTimeTZ(visit.hora_fin) : "",
     };
-    return res.json({ ok: true, visita: visitPayload, summary: { total_evidencias: evidencias.filter((item) => upper(item.tipo_evidencia) !== "ASISTENCIA").length, total_alertas: alertas.length }, summary_by_brand, evidencias, alertas });
+    return res.json({ ok: true, visita: visitPayload, summary: { total_evidencias: evidencias.filter((item) => upper(item.tipo_evidencia) !== "ASISTENCIA" && upper(item.status || "ACTIVA") !== "ANULADA").length, total_alertas: alertas.length }, summary_by_brand, evidencias, alertas });
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message || "visit expedient error" });
   }
