@@ -1436,29 +1436,21 @@ async function getTiposEvidenciaCatalog() {
 }
 
 async function getReglasPorMarca(marcaId) {
-  const catalog = await getTiposEvidenciaCatalog();
-  const catalogByType = new Map(catalog.map((item, idx) => [evidenceTypeKey(item.tipo_evidencia), { ...item, orden_catalogo: idx + 1 }]));
   try {
     const rows = await getSheetValues("REGLAS_EVIDENCIA!A2:H");
     const rules = rows
       .filter((row) => norm(row[0]) === marcaId && (row.length < 5 || isTrue(row[4] ?? "TRUE")))
-      .map((row, idx) => {
-        const tipo = canonicalEvidenceTypeLabel(row[1]);
-        const key = evidenceTypeKey(tipo);
-        const catalogInfo = catalogByType.get(key) || {};
-        return {
-          marca_id: marcaId,
-          tipo_evidencia: tipo,
-          fotos_requeridas: safeInt(row[2], catalogInfo.fotos_requeridas || 1),
-          requiere_antes_despues: isTrue(row[3]),
-          activa: row.length < 5 || isTrue(row[4] ?? "TRUE"),
-          orden: safeInt(row[5], catalogInfo.orden_catalogo || idx + 1),
-          obligatoria: row.length >= 7 ? isTrue(row[6]) : (catalogInfo.obligatoria ?? true),
-          observaciones: norm(row[7]),
-          descripcion_corta: catalogInfo.descripcion_corta || "",
-          origen: "REGLAS_EVIDENCIA",
-        };
-      })
+      .map((row, idx) => ({
+        marca_id: marcaId,
+        tipo_evidencia: canonicalEvidenceTypeLabel(row[1]),
+        fotos_requeridas: safeInt(row[2], 1),
+        requiere_antes_despues: isTrue(row[3]),
+        activa: row.length < 5 || isTrue(row[4] ?? "TRUE"),
+        orden: safeInt(row[5], idx + 1),
+        obligatoria: row.length >= 7 ? isTrue(row[6]) : true,
+        observaciones: norm(row[7]),
+        origen: "REGLAS_EVIDENCIA",
+      }))
       .filter((rule) => !!rule.tipo_evidencia);
 
     const seen = new Set();
