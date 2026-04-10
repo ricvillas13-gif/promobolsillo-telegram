@@ -333,9 +333,6 @@ function canonicalEvidenceTypeLabel(value) {
   const raw = norm(value);
   if (!raw) return "";
   const key = normalizeTextKey(raw);
-  if (key.includes("ANAQUEL") && key.includes("ACERCAMIENTO") && key.includes("PRECIO")) {
-    return "Anaquel/acercamiento/inventario/precios";
-  }
   if (key === "COMPETENCIA") return "Competencia";
   if (key === "FACHADA TIENDA") return "Fachada tienda";
   return raw;
@@ -1413,7 +1410,7 @@ async function resolveMarcaIdByName(marcaNombre) {
 
 async function getTiposEvidenciaCatalog() {
   try {
-    const rows = await getSheetValues("TIPOS_EVIDENCIA!A2:C");
+    const rows = await getSheetValues("TIPOS_EVIDENCIA!A2:D");
     const seen = new Set();
     const items = [];
     for (const row of rows) {
@@ -1426,6 +1423,7 @@ async function getTiposEvidenciaCatalog() {
         tipo_evidencia: tipo,
         descripcion_corta: norm(row[1]),
         fotos_requeridas: safeInt(row[2], 1),
+        obligatoria: row.length >= 4 ? !["FALSE","0","NO","N"].includes(upper(row[3])) : true,
       });
     }
     return items;
@@ -1435,54 +1433,43 @@ async function getTiposEvidenciaCatalog() {
 }
 
 async function getReglasPorMarca(marcaId) {
-  let rules = [];
-  try {
-    const rows = await getSheetValues("REGLAS_EVIDENCIA!A2:E");
-    rules = rows
-      .filter((row) => norm(row[0]) === marcaId && (row.length < 5 || isTrue(row[4] ?? "TRUE")))
-      .map((row) => ({
-        marca_id: marcaId,
-        tipo_evidencia: canonicalEvidenceTypeLabel(row[1]),
-        fotos_requeridas: safeInt(row[2], 1),
-        requiere_antes_despues: isTrue(row[3]),
-        origen: "REGLAS_EVIDENCIA",
-      }));
-  } catch {
-    rules = [];
-  }
   const catalog = await getTiposEvidenciaCatalog();
-  const merged = [];
-  const byType = new Map();
+  const catalogByType = new Map(catalog.map((item, idx) => [evidenceTypeKey(item.tipo_evidencia), { ...item, orden_catalogo: idx + 1 }]));
+  try {
+    const rows = await getSheetValues("REGLAS_EVIDENCIA!A2:H");
+    const rules = rows
+      .filter((row) => norm(row[0]) === marcaId && (row.length < 5 || isTrue(row[4] ?? "TRUE")))
+      .map((row, idx) => {
+        const tipo = canonicalEvidenceTypeLabel(row[1]);
+        const key = evidenceTypeKey(tipo);
+        const catalogInfo = catalogByType.get(key) || {};
+        return {
+          marca_id: marcaId,
+          tipo_evidencia: tipo,
+          fotos_requeridas: safeInt(row[2], catalogInfo.fotos_requeridas || 1),
+          requiere_antes_despues: isTrue(row[3]),
+          activa: row.length < 5 || isTrue(row[4] ?? "TRUE"),
+          orden: safeInt(row[5], catalogInfo.orden_catalogo || idx + 1),
+          obligatoria: row.length >= 7 ? isTrue(row[6]) : (catalogInfo.obligatoria ?? true),
+          observaciones: norm(row[7]),
+          descripcion_corta: catalogInfo.descripcion_corta || "",
+          origen: "REGLAS_EVIDENCIA",
+        };
+      })
+      .filter((rule) => !!rule.tipo_evidencia);
 
-  const pushUniqueRule = (rule) => {
-    const key = evidenceTypeKey(rule.tipo_evidencia);
-    if (!key) return;
-    if (byType.has(key)) {
-      const existing = byType.get(key);
-      if (existing.origen === "TIPOS_EVIDENCIA" && rule.origen === "REGLAS_EVIDENCIA") {
-        const idx = merged.findIndex((item) => evidenceTypeKey(item.tipo_evidencia) === key);
-        if (idx >= 0) merged[idx] = rule;
-        byType.set(key, rule);
-      }
-      return;
-    }
-    byType.set(key, rule);
-    merged.push(rule);
-  };
-
-  rules.forEach((rule) => pushUniqueRule(rule));
-  catalog.forEach((item) => {
-    pushUniqueRule({
-      marca_id: marcaId,
-      tipo_evidencia: canonicalEvidenceTypeLabel(item.tipo_evidencia),
-      fotos_requeridas: item.fotos_requeridas || 1,
-      requiere_antes_despues: false,
-      descripcion_corta: item.descripcion_corta,
-      origen: "TIPOS_EVIDENCIA",
-    });
-  });
-
-  return merged;
+    const seen = new Set();
+    return rules
+      .sort((a, b) => safeInt(a.orden, 9999) - safeInt(b.orden, 9999) || String(a.tipo_evidencia).localeCompare(String(b.tipo_evidencia)))
+      .filter((rule) => {
+        const key = evidenceTypeKey(rule.tipo_evidencia);
+        if (!key || seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+  } catch {
+    return [];
+  }
 }
 
 async function getAsignacionesActivas() {
@@ -2993,14 +2980,21 @@ app.post("/miniapp/promotor/evidence-context", async (req, res) => {
     const visitaId = norm(req.body?.visita_id);
     const visit = await getVisitById(visitaId);
     if (!visit || visit.promotor_id !== actor.profile.promotor_id) return res.status(404).json({ ok: false, error: "Visita no encontrada" });
-    const marcas = await getMarcasActivas();
     const tiendaMap = await getTiendaMap();
+    const marcaMap = await getMarcaMap();
+    const tiendaMarcas = await getTiendaMarcasActivasByTiendaId(visit.tienda_id);
+    const marcas = tiendaMarcas
+      .map((item) => ({
+        marca_id: item.marca_id,
+        marca_nombre: marcaMap[item.marca_id]?.marca_nombre || item.marca_id,
+      }))
+      .sort((a, b) => String(a.marca_nombre).localeCompare(String(b.marca_nombre)));
     return res.json({
       ok: true,
       visita: {
         visita_id: visit.visita_id,
         tienda_id: visit.tienda_id,
-        tienda_nombre: tiendaMap[visit.tienda_id]?.nombre_tienda || visit.tienda_id,
+        tienda_nombre: formatStoreLabel(tiendaMap[visit.tienda_id], visit.tienda_id),
       },
       marcas,
     });
@@ -3031,9 +3025,7 @@ app.post("/miniapp/promotor/evidence-rules", async (req, res) => {
       return out;
     };
 
-    if (!marcaId) {
-      return res.json({ ok: true, reglas: dedupeRules(await getTiposEvidenciaCatalog()) });
-    }
+    if (!marcaId) return res.json({ ok: true, reglas: [] });
     const reglas = dedupeRules(await getReglasPorMarca(marcaId));
     return res.json({ ok: true, reglas });
   } catch (error) {
