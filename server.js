@@ -1881,33 +1881,6 @@ async function getPromotorUsageStats(externalId) {
 }
 
 
-async function getSupervisorUsageStats(supervisorExternalId) {
-  const team = await getPromotoresDeSupervisor(supervisorExternalId);
-  const promotorIds = new Set(team.map((item) => item.promotor_id));
-  const visitMap = await getAllVisitsMap();
-  const all = await getEvidenciasAll();
-  const rows = all.filter((row) => {
-    const visit = visitMap[row.visita_id];
-    return visit && promotorIds.has(visit.promotor_id) && !!norm(row.url_foto) && upper(row.status) !== "ANULADA";
-  });
-  const today = todayISO();
-  const monthPrefix = today.slice(0, 7);
-  const todayRows = rows.filter((row) => row.fecha_hora && ymdInTZ(new Date(row.fecha_hora), APP_TZ) === today);
-  const monthRows = rows.filter((row) => row.fecha_hora && ymdInTZ(new Date(row.fecha_hora), APP_TZ).startsWith(monthPrefix));
-  const todayUsage = summarizeUsageFromRows(todayRows);
-  const monthUsage = summarizeUsageFromRows(monthRows);
-  const referencePct = Math.min(100, Number(((monthUsage.mb / 1024) * 100).toFixed(1)));
-  return {
-    today: todayUsage,
-    month: monthUsage,
-    reference: {
-      budget_mxn: 200,
-      reference_pct: referencePct,
-      estimated_mxn: Math.round((referencePct / 100) * 200),
-      note: "Estimado de uso del panel del supervisor. No es saldo real del operador.",
-    },
-  };
-}
 
 function summarizeVisitEvidenceByBrand(evidencias = [], marcaMap = {}) {
   const grouped = new Map();
