@@ -26,6 +26,14 @@ const EVPLUS_MIN_DIMENSION = 420;
 const EVPLUS_MIN_ESTIMATED_BYTES = 9000;
 const PHOTO_CELL_LIMIT = 48000;
 const pendingEvidenceAnalysisTimers = new Map();
+const pendingVisitTaskRecalcTimers = new Map();
+const SHEET_READ_CACHE_DEFAULT_TTL_MS = 45000;
+const SHEET_READ_CACHE_FAST_TTL_MS = 12000;
+const SHEET_READ_CACHE_SLOW_TTL_MS = 180000;
+const ACTOR_CACHE_TTL_MS = 60000;
+const sheetReadCache = new Map();
+const sheetReadInflight = new Map();
+const actorCache = new Map();
 
 const ALLOWED_ORIGINS = [MINIAPP_BASE_URL, PUBLIC_BASE_URL, "http://localhost:5173", "https://localhost:5173"].filter(Boolean);
 
@@ -65,30 +73,6 @@ function isTrue(value) {
 
 function unique(arr) {
   return Array.from(new Set((arr || []).filter(Boolean)));
-}
-
-function extractStoreDeterminant(tiendaId) {
-  const raw = norm(tiendaId);
-  const match = raw.match(/(\d+)\s*$/);
-  return match ? match[1] : "";
-}
-
-function formatStoreLabel(tiendaOrId, fallbackName = "") {
-  const tiendaId = typeof tiendaOrId === "object" && tiendaOrId ? norm(tiendaOrId.tienda_id) : norm(tiendaOrId);
-  const nombre = typeof tiendaOrId === "object" && tiendaOrId ? norm(tiendaOrId.nombre_tienda || fallbackName) : norm(fallbackName);
-  const determinante = extractStoreDeterminant(tiendaId);
-  if (!determinante) return nombre || tiendaId;
-  if (!nombre) return tiendaId;
-  if (nombre.startsWith(`${determinante} - `)) return nombre;
-  return `${determinante} - ${nombre}`;
-}
-
-function calcStayMinutes(startIso, endIso) {
-  if (!startIso || !endIso) return 0;
-  const start = new Date(startIso);
-  const end = new Date(endIso);
-  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return 0;
-  return Math.max(0, Math.round((end.getTime() - start.getTime()) / 60000));
 }
 
 function fitCell(value, limit = PHOTO_CELL_LIMIT) {
@@ -405,11 +389,99 @@ async function getActorFromRequest(req) {
   const initData = norm(req.body?.initData || req.headers["x-telegram-init-data"] || "");
   if (!initData) throw new Error("initData requerido");
   const validated = verifyTelegramInitData(initData);
-  const actor = await resolveActor(validated.external_id);
+  const actor = await resolveActorCached(validated.external_id);
   return { validated, actor };
 }
 
+
 let sheetsClient = null;
+
+function clone2dValues(values) {
+  return (values || []).map((row) => (Array.isArray(row) ? [...row] : row));
+}
+
+function cloneJson(value) {
+  return value == null ? value : JSON.parse(JSON.stringify(value));
+}
+
+function sheetNameFromRange(range = "") {
+  const raw = norm(String(range).split("!")[0]);
+  return raw.replace(/^'/, "").replace(/'$/, "");
+}
+
+function getSheetCacheTtlMs(range = "") {
+  const sheetName = sheetNameFromRange(range);
+  if (["SESIONES", "VISITAS", "EVIDENCIAS", "ALERTAS"].includes(sheetName)) return SHEET_READ_CACHE_FAST_TTL_MS;
+  if (["PROMOTORES", "SUPERVISORES", "ACCESOS_CLIENTE", "CLIENTES", "TIENDAS", "MARCAS", "TIPOS_EVIDENCIA", "REGLAS_EVIDENCIA", "TIENDA_MARCAS"].includes(sheetName)) {
+    return SHEET_READ_CACHE_SLOW_TTL_MS;
+  }
+  return SHEET_READ_CACHE_DEFAULT_TTL_MS;
+}
+
+function readSheetCache(range) {
+  const cached = sheetReadCache.get(range);
+  if (!cached) return null;
+  if (cached.expiresAt <= Date.now()) {
+    sheetReadCache.delete(range);
+    return null;
+  }
+  return clone2dValues(cached.values);
+}
+
+function writeSheetCache(range, values) {
+  sheetReadCache.set(range, {
+    values: clone2dValues(values),
+    expiresAt: Date.now() + getSheetCacheTtlMs(range),
+  });
+}
+
+function invalidateSheetCache(sheetNameOrRange = "") {
+  const sheetName = sheetNameFromRange(sheetNameOrRange);
+  if (!sheetName) {
+    sheetReadCache.clear();
+    return;
+  }
+  for (const key of Array.from(sheetReadCache.keys())) {
+    if (sheetNameFromRange(key) === sheetName) sheetReadCache.delete(key);
+  }
+}
+
+function isQuotaExceededError(error) {
+  const pieces = [
+    error?.message,
+    error?.response?.data?.error?.message,
+    Array.isArray(error?.errors) ? error.errors.map((item) => item?.message).join(" | ") : "",
+  ].filter(Boolean).join(" | ").toLowerCase();
+  return pieces.includes("quota exceeded") || pieces.includes("read requests per minute per user");
+}
+
+function buildFriendlySheetsError(error, range = "") {
+  if (isQuotaExceededError(error)) {
+    const friendly = new Error("Servicio temporalmente saturado por límite temporal de Google Sheets. Espera 30 a 60 segundos y vuelve a intentar.");
+    friendly.statusCode = 503;
+    friendly.isQuotaExceeded = true;
+    friendly.range = range;
+    return friendly;
+  }
+  return error;
+}
+
+function readActorCache(externalId) {
+  const cached = actorCache.get(externalId);
+  if (!cached) return null;
+  if (cached.expiresAt <= Date.now()) {
+    actorCache.delete(externalId);
+    return null;
+  }
+  return cloneJson(cached.value);
+}
+
+function writeActorCache(externalId, value) {
+  actorCache.set(externalId, {
+    value: cloneJson(value),
+    expiresAt: Date.now() + ACTOR_CACHE_TTL_MS,
+  });
+}
 
 async function getSheetsClient() {
   if (sheetsClient) return sheetsClient;
@@ -423,10 +495,30 @@ async function getSheetsClient() {
   return sheetsClient;
 }
 
-async function getSheetValues(range) {
-  const sheets = await getSheetsClient();
-  const res = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range });
-  return res.data.values || [];
+async function getSheetValues(range, options = {}) {
+  const useCache = options.useCache !== false;
+  if (useCache) {
+    const cached = readSheetCache(range);
+    if (cached) return cached;
+  }
+  if (useCache && sheetReadInflight.has(range)) {
+    return clone2dValues(await sheetReadInflight.get(range));
+  }
+  const loader = (async () => {
+    try {
+      const sheets = await getSheetsClient();
+      const res = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range });
+      const values = res.data.values || [];
+      if (useCache) writeSheetCache(range, values);
+      return clone2dValues(values);
+    } catch (error) {
+      throw buildFriendlySheetsError(error, range);
+    } finally {
+      if (useCache) sheetReadInflight.delete(range);
+    }
+  })();
+  if (useCache) sheetReadInflight.set(range, loader);
+  return clone2dValues(await loader);
 }
 
 async function appendSheetValues(range, values) {
@@ -437,6 +529,7 @@ async function appendSheetValues(range, values) {
     valueInputOption: "USER_ENTERED",
     requestBody: { values },
   });
+  invalidateSheetCache(range);
 }
 
 async function updateSheetValues(range, values) {
@@ -447,11 +540,17 @@ async function updateSheetValues(range, values) {
     valueInputOption: "USER_ENTERED",
     requestBody: { values },
   });
+  invalidateSheetCache(range);
 }
 
 async function getSheetHeader(sheetName) {
-  const values = await getSheetValues(`${sheetName}!1:1`);
-  return (values[0] || []).map((v) => norm(v));
+  try {
+    const values = await getSheetValues(`${sheetName}!1:1`);
+    return (values[0] || []).map((v) => norm(v));
+  } catch (error) {
+    if (error?.isQuotaExceeded) throw error;
+    throw new Error(`No se pudo leer la hoja ${sheetName}. Verifica que exista y que el nombre sea exacto.`);
+  }
 }
 
 async function getPolicyValidation() {
@@ -677,6 +776,14 @@ async function resolveActor(externalId) {
       nombre: "Usuario",
     },
   };
+}
+
+async function resolveActorCached(externalId) {
+  const cached = readActorCache(externalId);
+  if (cached) return cached;
+  const resolved = await resolveActor(externalId);
+  writeActorCache(externalId, resolved);
+  return resolved;
 }
 
 async function findSessionRow(externalId) {
@@ -962,13 +1069,13 @@ function buildAlertRowFromHeader(header, payload) {
 async function notifySupervisorAlert(payload) {
   try {
     const supervisorExternalId = norm(payload.supervisor_id);
-    if (!supervisorExternalId || !TELEGRAM_API) return { sent: false, status: "SKIPPED" };
+    if (!supervisorExternalId || !TELEGRAM_API) return { sent: false, status: "NO_SUPERVISOR", notified_at: "" };
     const chatId = await getChatIdByExternalId(supervisorExternalId);
-    if (!chatId) return { sent: false, status: "PENDING_CHAT" };
+    if (!chatId) return { sent: false, status: "PENDING_CHAT", notified_at: "" };
     const tiendaMap = await getTiendaMap();
     const promotorMap = await getPromotorMap();
     const marcaMap = await getMarcaMap();
-    const tiendaNombre = formatStoreLabel(tiendaMap[payload.tienda_id], payload.tienda_id || "Tienda");
+    const tiendaNombre = getStoreDisplayNameById(payload.tienda_id, tiendaMap) || payload.tienda_id || "Tienda";
     const promotorNombre = promotorMap[payload.promotor_id]?.nombre || payload.promotor_id || "Promotor";
     const evidenciaFound = payload.evidencia_id ? await getEvidenceById(payload.evidencia_id) : null;
     const evidencia = evidenciaFound?.evidence || null;
@@ -998,28 +1105,37 @@ async function notifySupervisorAlert(payload) {
     return { sent: true, status: "SENT", notified_at: nowISO() };
   } catch (error) {
     console.warn("notifySupervisorAlert error", error?.message || error);
-    return { sent: false, status: "ERROR", error: error?.message || String(error) };
+    return { sent: false, status: "FAILED", notified_at: "", error: error?.message || String(error) };
   }
 }
 
 async function flushPendingSupervisorAlerts(supervisorExternalId) {
   try {
+    const externalId = norm(supervisorExternalId);
+    if (!externalId) return { flushed: 0 };
+    const chatId = await getChatIdByExternalId(externalId);
+    if (!chatId) return { flushed: 0 };
     const alerts = await getAlertsAll();
-    const pending = alerts.filter((item) =>
-      norm(item.supervisor_id) === norm(supervisorExternalId) &&
-      (isTrue(item.pending_notification) || upper(item.notification_status) === "PENDING_CHAT")
-    );
-    for (const alert of pending) {
-      const result = await notifySupervisorAlert(alert);
-      const header = await getAlertsHeader();
-      await updateAlertRow(header, alert, {
-        notification_status: result.status || "ERROR",
-        notified_at: result.notified_at || alert.notified_at || "",
-        pending_notification: result.sent ? "FALSE" : "TRUE",
-      });
+    let flushed = 0;
+    for (const alert of alerts) {
+      const pending = isTrue(alert.pending_notification) || ["PENDING_CHAT", "FAILED"].includes(upper(alert.notification_status));
+      if (!pending) continue;
+      if (norm(alert.supervisor_id) !== externalId) continue;
+      const notify = await notifySupervisorAlert(alert);
+      if (notify.sent) {
+        const header = await getAlertsHeader();
+        await updateAlertRow(header, alert, {
+          notification_status: notify.status,
+          notified_at: notify.notified_at,
+          pending_notification: "FALSE",
+        });
+        flushed += 1;
+      }
     }
+    return { flushed };
   } catch (error) {
     console.warn("flushPendingSupervisorAlerts error", error?.message || error);
+    return { flushed: 0 };
   }
 }
 
@@ -1027,24 +1143,16 @@ async function createAlert(payload) {
   try {
     const header = await getAlertsHeader();
     if (!header.length) return false;
-    const initialPayload = {
+    const notifyPreview = await notifySupervisorAlert(payload);
+    const rowPayload = {
       ...payload,
-      notification_status: payload.notification_status || "",
-      notified_at: payload.notified_at || "",
-      pending_notification: payload.pending_notification || "FALSE",
+      notification_status: notifyPreview.status || "PENDING_CHAT",
+      notified_at: notifyPreview.notified_at || "",
+      pending_notification: notifyPreview.sent ? "FALSE" : (notifyPreview.status === "PENDING_CHAT" ? "TRUE" : "TRUE"),
       resolved_classification: payload.resolved_classification || "",
     };
-    const row = buildAlertRowFromHeader(header, initialPayload);
+    const row = buildAlertRowFromHeader(header, rowPayload);
     await appendSheetValues(`ALERTAS!A2:${headerRangeEnd(header.length)}`, [row]);
-    const found = await getAlertById(initialPayload.alerta_id);
-    const notifyResult = await notifySupervisorAlert(initialPayload);
-    if (found) {
-      await updateAlertRow(found.header, found.alert, {
-        notification_status: notifyResult.status || "ERROR",
-        notified_at: notifyResult.notified_at || "",
-        pending_notification: notifyResult.status === "PENDING_CHAT" ? "TRUE" : "FALSE",
-      });
-    }
     return true;
   } catch (error) {
     console.warn("createAlert error", error?.message || error);
@@ -1133,163 +1241,6 @@ async function getEvidenceById(evidenciaId) {
     if (evidence.evidencia_id === evidenciaId) return { header, evidence };
   }
   return null;
-}
-
-async function appendEvidenceAuditRow(payload = {}) {
-  try {
-    const header = await getSheetHeader("EVIDENCIAS_AUDIT");
-    if (!header.length) return false;
-    const row = new Array(header.length).fill("");
-    header.forEach((name, idx) => {
-      const key = norm(name);
-      row[idx] = payload[key] != null ? payload[key] : "";
-    });
-    await appendSheetValues(`EVIDENCIAS_AUDIT!A2:${headerRangeEnd(header.length)}`, [row]);
-    return true;
-  } catch (error) {
-    console.warn("appendEvidenceAuditRow error", error?.message || error);
-    return false;
-  }
-}
-
-async function auditEvidenceAction(payload = {}) {
-  return appendEvidenceAuditRow({
-    audit_id: payload.audit_id || `AUD-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-    fecha_hora: payload.fecha_hora || nowISO(),
-    evidencia_id: payload.evidencia_id || "",
-    accion: payload.accion || "",
-    actor_role: payload.actor_role || "",
-    actor_id: payload.actor_id || "",
-    estado_previo: payload.estado_previo || "",
-    estado_nuevo: payload.estado_nuevo || "",
-    hash_previo: payload.hash_previo || "",
-    hash_nuevo: payload.hash_nuevo || "",
-    comentario: payload.comentario || "",
-  });
-}
-
-function summarizeEvidenceTree(evidences = []) {
-  const marcaNodes = new Map();
-  for (const item of evidences) {
-    const marcaKey = norm(item.marca_id || "SIN_MARCA");
-    if (!marcaNodes.has(marcaKey)) {
-      marcaNodes.set(marcaKey, {
-        marca_id: item.marca_id || "",
-        marca_nombre: item.marca_nombre || item.marca_id || "Sin marca",
-        total: 0,
-        types: new Map(),
-      });
-    }
-    const marcaNode = marcaNodes.get(marcaKey);
-    marcaNode.total += 1;
-    const tipoKey = evidenceTypeKey(item.tipo_evidencia || "SIN_TIPO");
-    if (!marcaNode.types.has(tipoKey)) {
-      marcaNode.types.set(tipoKey, {
-        tipo_evidencia: item.tipo_evidencia || "Sin tipo",
-        total: 0,
-        phases: new Map(),
-      });
-    }
-    const typeNode = marcaNode.types.get(tipoKey);
-    typeNode.total += 1;
-    const faseKey = upper(item.fase || "NA");
-    if (!typeNode.phases.has(faseKey)) {
-      typeNode.phases.set(faseKey, { fase: item.fase || "NA", total: 0 });
-    }
-    typeNode.phases.get(faseKey).total += 1;
-  }
-  return Array.from(marcaNodes.values()).map((marcaNode) => ({
-    marca_id: marcaNode.marca_id,
-    marca_nombre: marcaNode.marca_nombre,
-    total: marcaNode.total,
-    types: Array.from(marcaNode.types.values()).map((typeNode) => ({
-      tipo_evidencia: typeNode.tipo_evidencia,
-      total: typeNode.total,
-      phases: Array.from(typeNode.phases.values()),
-    })),
-  }));
-}
-
-async function getSupervisorUsageStats(supervisorExternalId) {
-  const team = await getPromotoresDeSupervisor(supervisorExternalId);
-  const promotorIds = new Set(team.map((item) => item.promotor_id));
-  const visitMap = await getAllVisitsMap();
-  const all = await getEvidenciasAll();
-  const rows = all.filter((row) => {
-    const visit = visitMap[row.visita_id];
-    return visit && promotorIds.has(visit.promotor_id) && !!norm(row.url_foto) && upper(row.status) !== "ANULADA";
-  });
-  const today = todayISO();
-  const monthPrefix = today.slice(0, 7);
-  const todayRows = rows.filter((row) => row.fecha_hora && ymdInTZ(new Date(row.fecha_hora), APP_TZ) === today);
-  const monthRows = rows.filter((row) => row.fecha_hora && ymdInTZ(new Date(row.fecha_hora), APP_TZ).startsWith(monthPrefix));
-  const todayUsage = summarizeUsageFromRows(todayRows);
-  const monthUsage = summarizeUsageFromRows(monthRows);
-  const referencePct = Math.min(100, Number(((monthUsage.mb / 1024) * 100).toFixed(1)));
-  return {
-    today: todayUsage,
-    month: monthUsage,
-    reference: {
-      budget_mxn: 200,
-      reference_pct: referencePct,
-      estimated_mxn: Math.round((referencePct / 100) * 200),
-      note: "Estimado de uso del panel del supervisor. No es saldo real.",
-    },
-  };
-}
-
-async function getSupervisorPendingClose(supervisorExternalId) {
-  const team = await getPromotoresDeSupervisor(supervisorExternalId);
-  const promotorIds = new Set(team.map((item) => item.promotor_id));
-  let openVisits = 0;
-  for (const item of team) {
-    const visits = await getVisitasToday(item.promotor_id);
-    openVisits += visits.filter((visit) => !visit.hora_fin).length;
-  }
-  const alerts = await getAlertsAll();
-  const openAlerts = alerts.filter((alert) => promotorIds.has(alert.promotor_id) && upper(alert.status || "ABIERTA") === "ABIERTA").length;
-  const evidences = await getEvidenciasAll();
-  const visitMap = await getAllVisitsMap();
-  const pendingReviews = evidences.filter((item) => {
-    const visit = visitMap[item.visita_id];
-    if (!visit || !promotorIds.has(visit.promotor_id) || upper(item.tipo_evidencia) === "ASISTENCIA") return false;
-    return isTrue(item.requiere_revision_supervisor) || upper(item.status) === "PENDIENTE_REVISION";
-  }).length;
-  return { open_visits: openVisits, open_alerts: openAlerts, pending_reviews: pendingReviews };
-}
-
-async function buildSupervisorDayRouteRows(promotorId, dateYmd = todayISO()) {
-  const tiendaMap = await getTiendaMap();
-  const alerts = await getAlertsAll();
-  const evidences = await getEvidenciasAll();
-  const marcaMap = await getMarcaMap();
-  const visitMap = await getAllVisitsMap();
-  const promotorMap = await getPromotorMap();
-  const visits = (await getVisitasToday(promotorId))
-    .filter((visit) => visit.fecha === dateYmd)
-    .sort((a, b) => String(a.hora_inicio).localeCompare(String(b.hora_inicio)));
-  return visits.map((visit) => {
-    const visitEvidences = evidences
-      .filter((item) => item.visita_id === visit.visita_id && upper(item.status) !== "ANULADA")
-      .map((item) => buildEvidenceView(item, marcaMap, visitMap, tiendaMap, promotorMap));
-    const visitAlerts = alerts.filter((alert) => alert.visita_id === visit.visita_id);
-    const summaryTree = summarizeEvidenceTree(visitEvidences);
-    return {
-      visita_id: visit.visita_id,
-      tienda_id: visit.tienda_id,
-      tienda_nombre: formatStoreLabel(tiendaMap[visit.tienda_id], visit.tienda_id),
-      hora_inicio: visit.hora_inicio,
-      hora_fin: visit.hora_fin,
-      hora_inicio_fmt: fmtDateTimeTZ(visit.hora_inicio),
-      hora_fin_fmt: visit.hora_fin ? fmtDateTimeTZ(visit.hora_fin) : "",
-      stay_minutes: calcStayMinutes(visit.hora_inicio, visit.hora_fin),
-      geofence_entry: visit.resultado_geocerca_entrada || "",
-      geofence_exit: visit.resultado_geocerca_salida || "",
-      total_evidencias: visitEvidences.filter((item) => upper(item.tipo_evidencia) !== "ASISTENCIA").length,
-      total_alertas: visitAlerts.length,
-      summary_by_brand: summaryTree.map((node) => ({ marca_id: node.marca_id, marca_nombre: node.marca_nombre, total: node.total })),
-    };
-  });
 }
 
 async function getEvidenciasAll() {
@@ -1423,7 +1374,7 @@ async function getTiposEvidenciaCatalog() {
         tipo_evidencia: tipo,
         descripcion_corta: norm(row[1]),
         fotos_requeridas: safeInt(row[2], 1),
-        obligatoria: row.length >= 4 ? !["FALSE","0","NO","N"].includes(upper(row[3])) : true,
+        obligatoria: row.length >= 4 ? !["FALSE", "0", "NO", "N"].includes(upper(row[3])) : true,
       });
     }
     return items;
@@ -1881,6 +1832,33 @@ async function getPromotorUsageStats(externalId) {
 }
 
 
+async function getSupervisorUsageStats(supervisorExternalId) {
+  const team = await getPromotoresDeSupervisor(supervisorExternalId);
+  const promotorIds = new Set(team.map((item) => item.promotor_id));
+  const visitMap = await getAllVisitsMap();
+  const all = await getEvidenciasAll();
+  const rows = all.filter((row) => {
+    const visit = visitMap[row.visita_id];
+    return visit && promotorIds.has(visit.promotor_id) && !!norm(row.url_foto) && upper(row.status) !== "ANULADA";
+  });
+  const today = todayISO();
+  const monthPrefix = today.slice(0, 7);
+  const todayRows = rows.filter((row) => row.fecha_hora && ymdInTZ(new Date(row.fecha_hora), APP_TZ) === today);
+  const monthRows = rows.filter((row) => row.fecha_hora && ymdInTZ(new Date(row.fecha_hora), APP_TZ).startsWith(monthPrefix));
+  const todayUsage = summarizeUsageFromRows(todayRows);
+  const monthUsage = summarizeUsageFromRows(monthRows);
+  const referencePct = Math.min(100, Number(((monthUsage.mb / 1024) * 100).toFixed(1)));
+  return {
+    today: todayUsage,
+    month: monthUsage,
+    reference: {
+      budget_mxn: 200,
+      reference_pct: referencePct,
+      estimated_mxn: Math.round((referencePct / 100) * 200),
+      note: "Estimado de uso del panel del supervisor. No es saldo real del operador.",
+    },
+  };
+}
 
 function summarizeVisitEvidenceByBrand(evidencias = [], marcaMap = {}) {
   const grouped = new Map();
@@ -2224,6 +2202,27 @@ async function rerunEvidencePlusForGroup(visitaId, marcaId, tipoEvidencia, fase)
     });
     await maybeCreateEvidencePlusAlert({ ...item, hash_foto: analysis.hash_foto }, analysis, visit);
   }
+}
+
+
+
+function scheduleVisitTaskRecalculation(visitaId) {
+  const key = norm(visitaId);
+  if (!key) return;
+  const existing = pendingVisitTaskRecalcTimers.get(key);
+  if (existing) clearTimeout(existing);
+  const timer = setTimeout(async () => {
+    pendingVisitTaskRecalcTimers.delete(key);
+    try {
+      await recalculateTareasForVisita(key);
+    } catch (error) {
+      console.warn("scheduleVisitTaskRecalculation error", {
+        visitaId: key,
+        message: error?.message || error,
+      });
+    }
+  }, 3000);
+  pendingVisitTaskRecalcTimers.set(key, timer);
 }
 
 async function buildGeofenceContext(tiendaId, lat, lon, accuracy) {
@@ -2806,7 +2805,6 @@ external_id: telegram:${incoming.fromId}`
     const externalId = buildExternalIdFromTelegramUser(incoming.fromId);
     await upsertSessionData(externalId, { chat_id: String(incoming.chatId || ""), last_seen_at: nowISO() });
     const actor = await resolveActor(externalId);
-    if (actor.role === "supervisor") await flushPendingSupervisorAlerts(externalId);
     if (actor.role === "supervisor") {
       await flushPendingSupervisorAlerts(externalId);
     }
@@ -2872,7 +2870,8 @@ app.post("/miniapp/bootstrap", async (req, res) => {
       },
     });
   } catch (error) {
-    return res.status(401).json({ ok: false, error: error.message || "auth failed" });
+    const statusCode = error?.isQuotaExceeded ? 503 : 401;
+    return res.status(statusCode).json({ ok: false, error: error.message || "auth failed" });
   }
 });
 
@@ -2955,19 +2954,18 @@ app.post("/miniapp/promotor/evidence-context", async (req, res) => {
     if (!visit || visit.promotor_id !== actor.profile.promotor_id) return res.status(404).json({ ok: false, error: "Visita no encontrada" });
     const tiendaMap = await getTiendaMap();
     const marcaMap = await getMarcaMap();
-    const tiendaMarcas = await getTiendaMarcasActivasByTiendaId(visit.tienda_id);
-    const marcas = tiendaMarcas
-      .map((item) => ({
-        marca_id: item.marca_id,
-        marca_nombre: marcaMap[item.marca_id]?.marca_nombre || item.marca_id,
-      }))
-      .sort((a, b) => String(a.marca_nombre).localeCompare(String(b.marca_nombre)));
+    const marcasTienda = await getTiendaMarcasActivasByTiendaId(visit.tienda_id);
+    const marcas = marcasTienda.map((item) => ({
+      marca_id: item.marca_id,
+      marca_nombre: marcaMap[item.marca_id]?.marca_nombre || item.marca_id,
+    })).sort((a, b) => String(a.marca_nombre).localeCompare(String(b.marca_nombre)));
     return res.json({
       ok: true,
       visita: {
         visita_id: visit.visita_id,
         tienda_id: visit.tienda_id,
-        tienda_nombre: formatStoreLabel(tiendaMap[visit.tienda_id], visit.tienda_id),
+        tienda_nombre: tiendaMap[visit.tienda_id]?.nombre_tienda || visit.tienda_id,
+        tienda_display: getStoreDisplayNameById(visit.tienda_id, tiendaMap),
       },
       marcas,
     });
@@ -2998,7 +2996,9 @@ app.post("/miniapp/promotor/evidence-rules", async (req, res) => {
       return out;
     };
 
-    if (!marcaId) return res.json({ ok: true, reglas: [] });
+    if (!marcaId) {
+      return res.json({ ok: true, reglas: [] });
+    }
     const reglas = dedupeRules(await getReglasPorMarca(marcaId));
     return res.json({ ok: true, reglas });
   } catch (error) {
@@ -3137,6 +3137,7 @@ app.post("/miniapp/promotor/close-visit", async (req, res) => {
   }
 });
 
+
 app.post("/miniapp/promotor/evidence-register", async (req, res) => {
   try {
     const { actor } = await getActorFromRequest(req);
@@ -3197,9 +3198,15 @@ app.post("/miniapp/promotor/evidence-register", async (req, res) => {
     });
 
     const batchResult = await registrarEvidenciasBatch(batchPayloads);
+    const warnings = [];
 
-    scheduleEvidenceGroupAnalysis({ visitaId, marcaId, tipoEvidencia, fase });
-    await recalculateTareasForVisita(visitaId);
+    try {
+      scheduleEvidenceGroupAnalysis({ visitaId, marcaId, tipoEvidencia, fase });
+      scheduleVisitTaskRecalculation(visitaId);
+    } catch (postprocessError) {
+      console.warn("evidence-register postprocess warning", postprocessError?.message || postprocessError);
+      warnings.push(postprocessError?.message || "postprocess_warning");
+    }
 
     return res.json({
       ok: true,
@@ -3208,10 +3215,12 @@ app.post("/miniapp/promotor/evidence-register", async (req, res) => {
       count: created.length,
       warning: batchResult.photoOverflow ? "evidence_photo_too_large_for_sheets" : undefined,
       analysis_status: "scheduled",
+      postprocess_warning: warnings[0] || undefined,
     });
   } catch (error) {
     console.error("evidence-register error", error);
-    return res.status(500).json({ ok: false, error: error.message || "No se pudo registrar la evidencia." });
+    const statusCode = error?.isQuotaExceeded ? 503 : 500;
+    return res.status(statusCode).json({ ok: false, error: error.message || "No se pudo registrar la evidencia." });
   }
 });
 
@@ -3227,17 +3236,6 @@ app.post("/miniapp/promotor/cancel-evidence", async (req, res) => {
     await updateEvidenceRow(found.header, found.evidence, {
       status: "ANULADA",
       note: note ? `${found.evidence.note ? `${found.evidence.note} | ` : ""}${note}` : found.evidence.note,
-    });
-    await auditEvidenceAction({
-      evidencia_id: evidenciaId,
-      accion: "ANULAR",
-      actor_role: "promotor",
-      actor_id: actor.profile.promotor_id || actor.profile.external_id,
-      estado_previo: found.evidence.status || "ACTIVA",
-      estado_nuevo: "ANULADA",
-      hash_previo: found.evidence.hash_foto || "",
-      hash_nuevo: found.evidence.hash_foto || "",
-      comentario: note,
     });
     if (upper(found.evidence.tipo_evidencia) !== "ASISTENCIA") {
       scheduleEvidenceGroupAnalysis({
@@ -3264,8 +3262,6 @@ app.post("/miniapp/promotor/replace-evidence", async (req, res) => {
     const found = await getEvidenceById(evidenciaId);
     if (!found) return res.status(404).json({ ok: false, error: "Evidencia no encontrada" });
     if (found.evidence.external_id !== actor.profile.external_id) return res.status(403).json({ ok: false, error: "No autorizada" });
-    const previousHash = found.evidence.hash_foto || "";
-    const nextHash = buildEvidencePhotoHash(fotoDataUrl, fotoNombre);
     const result = await updateEvidenceRow(found.header, found.evidence, {
       url_foto: fotoDataUrl,
       foto_nombre: fotoNombre,
@@ -3276,19 +3272,8 @@ app.post("/miniapp/promotor/replace-evidence", async (req, res) => {
       reglas_disparadas: "",
       analizado_at: "",
       version_motor_ai: "",
-      hash_foto: nextHash,
+      hash_foto: buildEvidencePhotoHash(fotoDataUrl, fotoNombre),
       requiere_revision_supervisor: "FALSE",
-    });
-    await auditEvidenceAction({
-      evidencia_id: evidenciaId,
-      accion: "REEMPLAZAR",
-      actor_role: "promotor",
-      actor_id: actor.profile.promotor_id || actor.profile.external_id,
-      estado_previo: found.evidence.status || "ACTIVA",
-      estado_nuevo: "ACTIVA",
-      hash_previo: previousHash,
-      hash_nuevo: nextHash,
-      comentario: fotoNombre,
     });
     if (upper(found.evidence.tipo_evidencia) !== "ASISTENCIA") {
       scheduleEvidenceGroupAnalysis({
@@ -3343,7 +3328,7 @@ app.post("/miniapp/supervisor/dashboard", async (req, res) => {
       return visit && promotorIds.includes(visit.promotor_id) && ymdInTZ(new Date(item.fecha_hora), APP_TZ) === todayISO() && upper(item.tipo_evidencia) !== "ASISTENCIA";
     }).length;
     const usage = await getSupervisorUsageStats(actor.profile.external_id);
-    const pending_close = await getSupervisorPendingClose(actor.profile.external_id);
+    const pending_close = await getPendingCloseStatsForSupervisor(actor.profile.external_id);
     return res.json({
       ok: true,
       supervisor: { nombre: actor.profile.nombre },
@@ -3363,8 +3348,8 @@ app.post("/miniapp/supervisor/team", async (req, res) => {
     const team = await getPromotoresDeSupervisor(actor.profile.external_id);
     const alerts = await getAlertsAll();
     const evidences = await getEvidenciasAll();
-    const today = todayISO();
     const tiendaMap = await getTiendaMap();
+    const today = todayISO();
     const rows = [];
     for (const member of team) {
       const visits = await getVisitasToday(member.promotor_id);
@@ -3376,6 +3361,7 @@ app.post("/miniapp/supervisor/team", async (req, res) => {
       if (alertasAbiertas > 0) statusGeneral = "ALERTA";
       else if (openVisits.length > 0) statusGeneral = "ACTIVO";
       else if (visits.length > 0) statusGeneral = "OPERANDO";
+      const totalStayMinutes = visits.reduce((sum, visit) => sum + (visit.hora_fin ? minutesBetweenIso(visit.hora_inicio, visit.hora_fin) : 0), 0);
       rows.push({
         promotor_id: member.promotor_id,
         external_id: member.external_id,
@@ -3386,9 +3372,9 @@ app.post("/miniapp/supervisor/team", async (req, res) => {
         evidencias_hoy: evidenciasHoy,
         alertas_abiertas: alertasAbiertas,
         route_today_count: visits.length,
+        total_stay_minutes: totalStayMinutes,
         stores_visited: unique(visits.map((visit) => visit.tienda_id)).length,
-        total_stay_minutes: visits.reduce((sum, visit) => sum + calcStayMinutes(visit.hora_inicio, visit.hora_fin), 0),
-        ultima_tienda: latest ? formatStoreLabel(tiendaMap[latest.tienda_id], latest.tienda_id) : "",
+        ultima_tienda: latest?.tienda_id ? getStoreDisplayNameById(latest.tienda_id, tiendaMap) : "",
         ultima_entrada: latest?.hora_inicio || "",
         ultima_salida: latest?.hora_fin || "",
         ultima_visita_id: latest?.visita_id || "",
@@ -3419,14 +3405,21 @@ app.post("/miniapp/supervisor/alerts", async (req, res) => {
     alerts.sort((a, b) => String(b.fecha_hora).localeCompare(String(a.fecha_hora)));
     const visible = [];
     for (const item of alerts) {
-      const evidenceFound = item.evidencia_id ? await getEvidenceById(item.evidencia_id) : null;
+      let photo_url = "";
+      if (item.evidencia_id) {
+        const found = await getEvidenceById(item.evidencia_id);
+        photo_url = norm(found?.evidence?.url_foto);
+      }
       visible.push({
         ...item,
         promotor_nombre: promotorMap[item.promotor_id]?.nombre || item.promotor_id,
         fecha_hora_fmt: fmtDateTimeTZ(item.fecha_hora),
-        tienda_nombre: formatStoreLabel(tiendaMap[item.tienda_id], item.tienda_id),
-        has_photo: !!norm(evidenceFound?.evidence?.url_foto),
-        photo_url: norm(evidenceFound?.evidence?.url_foto),
+        tienda_nombre: getStoreDisplayNameById(item.tienda_id, tiendaMap) || item.tienda_id,
+        has_photo: !!item.evidencia_id,
+        notification_status: item.notification_status || "",
+        notified_at: item.notified_at || "",
+        pending_notification: item.pending_notification || "FALSE",
+        photo_url,
       });
     }
     return res.json({ ok: true, alerts: visible });
@@ -3514,17 +3507,6 @@ app.post("/miniapp/supervisor/evidence-review", async (req, res) => {
       requiere_revision_supervisor: decision === "APROBADA" ? "FALSE" : "TRUE",
       status: decision || found.evidence.status,
     });
-    await auditEvidenceAction({
-      evidencia_id: evidenciaId,
-      accion: "REVISAR",
-      actor_role: "supervisor",
-      actor_id: actor.profile.supervisor_id || actor.profile.external_id,
-      estado_previo: found.evidence.status || "",
-      estado_nuevo: decision || found.evidence.status || "",
-      hash_previo: found.evidence.hash_foto || "",
-      hash_nuevo: found.evidence.hash_foto || "",
-      comentario: motivo,
-    });
     return res.json({ ok: true, evidencia_id: evidenciaId, decision_supervisor: decision, status: decision });
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message || "evidence review error" });
@@ -3545,36 +3527,27 @@ app.post("/miniapp/supervisor/visit-expedient", async (req, res) => {
     const visitMap = await getAllVisitsMap();
     const tiendaMap = await getTiendaMap();
     const promotorMap = await getPromotorMap();
-    const evidencias = (await getEvidenciasByVisitId(visitaId))
-      .map((item) => buildEvidenceView(item, marcaMap, visitMap, tiendaMap, promotorMap));
+    const evidenciasRaw = await getEvidenciasByVisitId(visitaId);
+    const evidencias = evidenciasRaw.map((item) => buildEvidenceView(item, marcaMap, visitMap, tiendaMap, promotorMap));
     const alertas = (await getAlertsAll())
       .filter((item) => item.visita_id === visitaId)
       .map((item) => ({
         ...item,
         promotor_nombre: promotorMap[item.promotor_id]?.nombre || item.promotor_id,
         fecha_hora_fmt: fmtDateTimeTZ(item.fecha_hora),
-        tienda_nombre: formatStoreLabel(tiendaMap[item.tienda_id], item.tienda_id),
+        tienda_nombre: getStoreDisplayNameById(item.tienda_id, tiendaMap) || item.tienda_id,
       }));
-    const summaryByBrand = summarizeEvidenceTree(evidencias.filter((item) => upper(item.tipo_evidencia) !== "ASISTENCIA"));
+    const stay_minutes = visit.hora_fin ? minutesBetweenIso(visit.hora_inicio, visit.hora_fin) : 0;
+    const summary_by_brand = summarizeVisitEvidenceByBrand(evidenciasRaw, marcaMap);
     const visitPayload = {
       ...visit,
-      tienda_nombre: formatStoreLabel(tiendaMap[visit.tienda_id], visit.tienda_id),
+      tienda_nombre: getStoreDisplayNameById(visit.tienda_id, tiendaMap) || visit.tienda_id,
       promotor_nombre: promotorMap[visit.promotor_id]?.nombre || visit.promotor_id,
+      stay_minutes,
       entry_fmt: fmtDateTimeTZ(visit.hora_inicio),
       exit_fmt: visit.hora_fin ? fmtDateTimeTZ(visit.hora_fin) : "",
-      stay_minutes: calcStayMinutes(visit.hora_inicio, visit.hora_fin),
     };
-    return res.json({
-      ok: true,
-      visita: visitPayload,
-      summary: {
-        total_evidencias: evidencias.filter((item) => upper(item.tipo_evidencia) !== "ASISTENCIA").length,
-        total_alertas: alertas.length,
-      },
-      summary_by_brand: summaryByBrand,
-      evidencias,
-      alertas,
-    });
+    return res.json({ ok: true, visita: visitPayload, summary: { total_evidencias: evidencias.filter((item) => upper(item.tipo_evidencia) !== "ASISTENCIA").length, total_alertas: alertas.length }, summary_by_brand, evidencias, alertas });
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message || "visit expedient error" });
   }
@@ -3585,15 +3558,32 @@ app.post("/miniapp/supervisor/day-route", async (req, res) => {
     const { actor } = await getActorFromRequest(req);
     if (actor.role !== "supervisor") return res.status(403).json({ ok: false, error: "Solo supervisor" });
     const promotorId = norm(req.body?.promotor_id);
-    if (!promotorId) return res.status(400).json({ ok: false, error: "promotor_id requerido" });
+    const fecha = norm(req.body?.fecha || todayISO());
     const team = await getPromotoresDeSupervisor(actor.profile.external_id);
     const promotorIds = new Set(team.map((item) => item.promotor_id));
+    if (!promotorId) return res.status(400).json({ ok: false, error: "promotor_id requerido" });
     if (!promotorIds.has(promotorId)) return res.status(403).json({ ok: false, error: "No autorizado" });
-    const fecha = norm(req.body?.fecha || todayISO());
-    const rows = await buildSupervisorDayRouteRows(promotorId, fecha);
+    const rows = await buildDayRouteRowsForPromotor(promotorId, fecha);
     return res.json({ ok: true, promotor_id: promotorId, fecha, rows });
   } catch (error) {
-    return res.status(500).json({ ok: false, error: error.message || "supervisor day-route error" });
+    return res.status(500).json({ ok: false, error: error.message || "day-route error" });
+  }
+});
+
+app.post("/miniapp/supervisor/promotor-visits-today", async (req, res) => {
+  try {
+    const { actor } = await getActorFromRequest(req);
+    if (actor.role !== "supervisor") return res.status(403).json({ ok: false, error: "Solo supervisor" });
+    const promotorId = norm(req.body?.promotor_id);
+    const fecha = norm(req.body?.fecha || todayISO());
+    const team = await getPromotoresDeSupervisor(actor.profile.external_id);
+    const promotorIds = new Set(team.map((item) => item.promotor_id));
+    if (!promotorId) return res.status(400).json({ ok: false, error: "promotor_id requerido" });
+    if (!promotorIds.has(promotorId)) return res.status(403).json({ ok: false, error: "No autorizado" });
+    const rows = await buildDayRouteRowsForPromotor(promotorId, fecha);
+    return res.json({ ok: true, promotor_id: promotorId, fecha, rows });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message || "promotor-visits-today error" });
   }
 });
 
@@ -3601,54 +3591,26 @@ app.post("/miniapp/promotor/alerts-recent", async (req, res) => {
   try {
     const { actor } = await getActorFromRequest(req);
     if (actor.role !== "promotor") return res.status(403).json({ ok: false, error: "Solo promotor" });
+    const promotorId = actor.profile.promotor_id;
     const tiendaMap = await getTiendaMap();
+    const today = todayISO();
     const rows = (await getAlertsAll())
-      .filter((item) => item.promotor_id === actor.profile.promotor_id)
+      .filter((item) => item.promotor_id === promotorId && item.fecha_hora && ymdInTZ(new Date(item.fecha_hora), APP_TZ) === today)
       .sort((a, b) => String(b.fecha_hora).localeCompare(String(a.fecha_hora)))
       .slice(0, 10)
       .map((item) => ({
         alerta_id: item.alerta_id,
         tipo_alerta: item.tipo_alerta,
         status: item.status,
+        resolved_classification: norm(item.resolved_classification || item.comentario_cierre || ""),
         fecha_hora: item.fecha_hora,
         fecha_hora_fmt: fmtDateTimeTZ(item.fecha_hora),
         tienda_id: item.tienda_id,
-        tienda_nombre: formatStoreLabel(tiendaMap[item.tienda_id], item.tienda_id),
-        resolved_classification: item.resolved_classification || "",
+        tienda_nombre: getStoreDisplayNameById(item.tienda_id, tiendaMap) || item.tienda_id,
       }));
     return res.json({ ok: true, rows });
   } catch (error) {
-    return res.status(500).json({ ok: false, error: error.message || "promotor alerts recent error" });
-  }
-});
-
-app.post("/miniapp/supervisor/evidence-audit", async (req, res) => {
-  try {
-    const { actor } = await getActorFromRequest(req);
-    if (actor.role !== "supervisor") return res.status(403).json({ ok: false, error: "Solo supervisor" });
-    const evidenciaId = norm(req.body?.evidencia_id);
-    if (!evidenciaId) return res.status(400).json({ ok: false, error: "evidencia_id requerido" });
-    const header = await getSheetHeader("EVIDENCIAS_AUDIT");
-    if (!header.length) return res.json({ ok: true, rows: [] });
-    const rows = await getSheetValues(`EVIDENCIAS_AUDIT!A2:${headerRangeEnd(header.length)}`);
-    const map = headerIndexMap(header);
-    const parsed = rows.map((row) => ({
-      audit_id: norm(row[map.audit_id]),
-      fecha_hora: norm(row[map.fecha_hora]),
-      accion: norm(row[map.accion]),
-      evidencia_id: norm(row[map.evidencia_id]),
-      actor_role: norm(row[map.actor_role]),
-      actor_id: norm(row[map.actor_id]),
-      estado_previo: norm(row[map.estado_previo]),
-      estado_nuevo: norm(row[map.estado_nuevo]),
-      comentario: norm(row[map.comentario]),
-      hash_previo: norm(row[map.hash_previo]),
-      hash_nuevo: norm(row[map.hash_nuevo]),
-    })).filter((item) => item.evidencia_id === evidenciaId)
-      .sort((a, b) => String(b.fecha_hora).localeCompare(String(a.fecha_hora)));
-    return res.json({ ok: true, rows: parsed });
-  } catch (error) {
-    return res.status(500).json({ ok: false, error: error.message || "supervisor evidence-audit error" });
+    return res.status(500).json({ ok: false, error: error.message || "alerts recent error" });
   }
 });
 
