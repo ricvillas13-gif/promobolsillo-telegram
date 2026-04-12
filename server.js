@@ -1002,6 +1002,7 @@ async function closeVisitWithGeofence(visit, closeNotes, geofence) {
   }
   const row = buildVisitRowFromHeader(header, payload);
   await updateSheetValues(`VISITAS!A${visit.rowIndex}:${headerRangeEnd(header.length)}${visit.rowIndex}`, [row]);
+}
 
 async function closeVisitWithoutExitCapture(visit, closeNotes) {
   const header = await getVisitsHeader();
@@ -1019,8 +1020,6 @@ async function closeVisitWithoutExitCapture(visit, closeNotes) {
   };
   const row = buildVisitRowFromHeader(header, payload);
   await updateSheetValues(`VISITAS!A${visit.rowIndex}:${headerRangeEnd(header.length)}${visit.rowIndex}`, [row]);
-}
-
 }
 
 async function getAlertsHeader() {
