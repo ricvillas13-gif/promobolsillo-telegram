@@ -1345,6 +1345,29 @@ async function validateBeforeAfterClose(visitaId) {
   return { ok: !missing.length, missing };
 }
 
+
+
+async function validateAfterRequiresBefore(visitaId, marcaId, tipoEvidencia, fase) {
+  if (upper(fase || "NA") !== "DESPUES") return { ok: true };
+  const rules = marcaId ? await getReglasPorMarca(marcaId) : [];
+  const rule = rules.find((row) => evidenceTypeKey(row.tipo_evidencia) === evidenceTypeKey(tipoEvidencia));
+  if (!rule?.requiere_antes_despues) return { ok: true };
+
+  const evidences = await getEvidenciasByVisitId(visitaId);
+  const hasAntes = evidences.some((item) =>
+    upper(item.status) !== "ANULADA" &&
+    upper(item.marca_id) === upper(marcaId) &&
+    evidenceTypeKey(item.tipo_evidencia) === evidenceTypeKey(tipoEvidencia) &&
+    upper(item.fase || "NA") === "ANTES"
+  );
+
+  if (hasAntes) return { ok: true };
+
+  return {
+    ok: false,
+    error: `Primero debes registrar al menos 1 foto ANTES para ${marcaId || "la marca"} (${tipoEvidencia}).`,
+  };
+}
 async function registrarEvidencia(payload) {
   const result = await registrarEvidenciasBatch([payload]);
   return { photoOverflow: result.photoOverflow, originalPhotoLength: result.maxOriginalPhotoLength || 0 };
@@ -3227,6 +3250,11 @@ app.post("/miniapp/promotor/evidence-register", async (req, res) => {
     if (!fotos.length) return res.status(400).json({ ok: false, error: "Debes enviar al menos una foto" });
 
     const marcaId = marcaIdRaw || (await resolveMarcaIdByName(marcaNombreRaw));
+    const afterBeforeCheck = await validateAfterRequiresBefore(visitaId, marcaId, tipoEvidencia, fase);
+    if (!afterBeforeCheck.ok) {
+      return res.status(409).json({ ok: false, error: afterBeforeCheck.error });
+    }
+
     const created = [];
     const batchPayloads = fotos.map((photo) => {
       const evidenceId = `EV-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
