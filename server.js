@@ -2513,7 +2513,7 @@ async function respondPromotorShortcut(actor, key) {
     const visits = await getVisitasToday(actor.profile.promotor_id);
     const open = visits.filter((v) => !v.hora_fin).length;
     return {
-      text: `🕒 *Asistencia*\n\nVisitas hoy: *${visits.length}*\nAbiertas: *${open}*\n\nAbre la Mini App para registrar entrada/salida con geocerca, ubicación y foto.`,
+      text: `🕒 *Asistencia*\n\nVisitas hoy: *${visits.length}*\nAbiertas: *${open}*\n\nAbre la Mini App para registrar entrada y salida. La salida se cierra desde la Mini App y las evidencias se capturan solo con cámara.`,
       reply_markup: { inline_keyboard: [[{ text: "Abrir asistencia", web_app: { url: getMiniAppUrl() } }]] },
     };
   }
@@ -3571,7 +3571,7 @@ app.post("/miniapp/supervisor/evidences", async (req, res) => {
     const visitMap = await getAllVisitsMap();
     const tiendaMap = await getTiendaMap();
     const promotorMap = await getPromotorMap();
-    let evidences = (await getEvidenciasAll()).filter((item) => upper(item.tipo_evidencia) !== "ASISTENCIA" && upper(item.status) !== "ANULADA" && promotorIds.has(visitMap[item.visita_id]?.promotor_id));
+    let evidences = (await getEvidenciasAll()).filter((item) => upper(item.tipo_evidencia) !== "ASISTENCIA" && upper(item.status) !== "ANULADA" && upper(item.decision_supervisor || item.status) !== "APROBADA" && promotorIds.has(visitMap[item.visita_id]?.promotor_id));
     const promotorFilter = norm(req.body?.promotor_id);
     const tiendaFilter = norm(req.body?.tienda_id);
     const marcaFilter = norm(req.body?.marca_id);
