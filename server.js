@@ -1345,29 +1345,6 @@ async function validateBeforeAfterClose(visitaId) {
   return { ok: !missing.length, missing };
 }
 
-
-
-async function validateAfterRequiresBefore(visitaId, marcaId, tipoEvidencia, fase) {
-  if (upper(fase || "NA") !== "DESPUES") return { ok: true };
-  const rules = marcaId ? await getReglasPorMarca(marcaId) : [];
-  const rule = rules.find((row) => evidenceTypeKey(row.tipo_evidencia) === evidenceTypeKey(tipoEvidencia));
-  if (!rule?.requiere_antes_despues) return { ok: true };
-
-  const evidences = await getEvidenciasByVisitId(visitaId);
-  const hasAntes = evidences.some((item) =>
-    upper(item.status) !== "ANULADA" &&
-    upper(item.marca_id) === upper(marcaId) &&
-    evidenceTypeKey(item.tipo_evidencia) === evidenceTypeKey(tipoEvidencia) &&
-    upper(item.fase || "NA") === "ANTES"
-  );
-
-  if (hasAntes) return { ok: true };
-
-  return {
-    ok: false,
-    error: `Primero debes registrar al menos 1 foto ANTES para ${marcaId || "la marca"} (${tipoEvidencia}).`,
-  };
-}
 async function registrarEvidencia(payload) {
   const result = await registrarEvidenciasBatch([payload]);
   return { photoOverflow: result.photoOverflow, originalPhotoLength: result.maxOriginalPhotoLength || 0 };
@@ -2513,7 +2490,7 @@ async function respondPromotorShortcut(actor, key) {
     const visits = await getVisitasToday(actor.profile.promotor_id);
     const open = visits.filter((v) => !v.hora_fin).length;
     return {
-      text: `🕒 *Asistencia*\n\nVisitas hoy: *${visits.length}*\nAbiertas: *${open}*\n\nAbre la Mini App para registrar entrada y salida. La salida se cierra desde la Mini App y las evidencias se capturan solo con cámara.`,
+      text: `🕒 *Asistencia*\n\nVisitas hoy: *${visits.length}*\nAbiertas: *${open}*\n\nAbre la Mini App para registrar entrada/salida con geocerca, ubicación y foto.`,
       reply_markup: { inline_keyboard: [[{ text: "Abrir asistencia", web_app: { url: getMiniAppUrl() } }]] },
     };
   }
@@ -3250,9 +3227,26 @@ app.post("/miniapp/promotor/evidence-register", async (req, res) => {
     if (!fotos.length) return res.status(400).json({ ok: false, error: "Debes enviar al menos una foto" });
 
     const marcaId = marcaIdRaw || (await resolveMarcaIdByName(marcaNombreRaw));
-    const afterBeforeCheck = await validateAfterRequiresBefore(visitaId, marcaId, tipoEvidencia, fase);
-    if (!afterBeforeCheck.ok) {
-      return res.status(409).json({ ok: false, error: afterBeforeCheck.error });
+
+    if (upper(fase) === "DESPUES" && marcaId) {
+      const reglas = await getReglasPorMarca(marcaId);
+      const reglaSeleccionada = reglas.find((row) => evidenceTypeKey(row.tipo_evidencia) === evidenceTypeKey(tipoEvidencia));
+      if (reglaSeleccionada?.requiere_antes_despues) {
+        const evidenciasActuales = await getEvidenciasByVisitId(visitaId);
+        const tieneAntes = evidenciasActuales.some((item) =>
+          upper(item.status) !== "ANULADA" &&
+          upper(item.marca_id) === upper(marcaId) &&
+          evidenceTypeKey(item.tipo_evidencia) === evidenceTypeKey(tipoEvidencia) &&
+          upper(item.fase || "NA") === "ANTES"
+        );
+        if (!tieneAntes) {
+          const marcaLabel = marcaNombreRaw || (await getMarcaMap())[marcaId]?.marca_nombre || marcaId;
+          return res.status(409).json({
+            ok: false,
+            error: `Primero debes registrar al menos 1 foto ANTES para ${marcaLabel} (${tipoEvidencia}).`,
+          });
+        }
+      }
     }
 
     const created = [];
@@ -3571,7 +3565,7 @@ app.post("/miniapp/supervisor/evidences", async (req, res) => {
     const visitMap = await getAllVisitsMap();
     const tiendaMap = await getTiendaMap();
     const promotorMap = await getPromotorMap();
-    let evidences = (await getEvidenciasAll()).filter((item) => upper(item.tipo_evidencia) !== "ASISTENCIA" && upper(item.status) !== "ANULADA" && upper(item.decision_supervisor || item.status) !== "APROBADA" && promotorIds.has(visitMap[item.visita_id]?.promotor_id));
+    let evidences = (await getEvidenciasAll()).filter((item) => upper(item.tipo_evidencia) !== "ASISTENCIA" && upper(item.status) !== "ANULADA" && promotorIds.has(visitMap[item.visita_id]?.promotor_id));
     const promotorFilter = norm(req.body?.promotor_id);
     const tiendaFilter = norm(req.body?.tienda_id);
     const marcaFilter = norm(req.body?.marca_id);
