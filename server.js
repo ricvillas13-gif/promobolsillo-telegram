@@ -2,6 +2,7 @@ import express from "express";
 import bodyParser from "body-parser";
 import crypto from "crypto";
 import { google } from "googleapis";
+import { Readable } from "node:stream";
 
 const {
   PORT = 10000,
@@ -11,6 +12,8 @@ const {
   TELEGRAM_BOT_TOKEN,
   MINIAPP_BASE_URL,
   PUBLIC_BASE_URL,
+  GOOGLE_DRIVE_EVIDENCE_FOLDER_ID,
+  DRIVE_EVIDENCE_FOLDER_ID,
 } = process.env;
 
 if (!SHEET_ID) throw new Error("Missing SHEET_ID");
@@ -25,6 +28,7 @@ const EVPLUS_VERSION = "EVPLUS_V1";
 const EVPLUS_MIN_DIMENSION = 420;
 const EVPLUS_MIN_ESTIMATED_BYTES = 9000;
 const PHOTO_CELL_LIMIT = 48000;
+const EVIDENCE_DRIVE_FOLDER_ID = GOOGLE_DRIVE_EVIDENCE_FOLDER_ID || DRIVE_EVIDENCE_FOLDER_ID || "";
 const pendingEvidenceAnalysisTimers = new Map();
 const pendingVisitTaskRecalcTimers = new Map();
 const SHEET_READ_CACHE_DEFAULT_TTL_MS = 45000;
@@ -298,6 +302,130 @@ function getImageMeta(photoValue) {
   };
 }
 
+function parseImageMetaFromNote(noteValue) {
+  const note = norm(noteValue);
+  const match = note.match(/IMG_META:(\d+)x(\d+)\|(\d+)\|([^\s|]+)/i);
+  if (!match) return null;
+  return {
+    mime: norm(match[4]),
+    width: safeInt(match[1], 0),
+    height: safeInt(match[2], 0),
+    estimated_bytes: safeInt(match[3], 0),
+    isDataUrl: false,
+    hasMeta: true,
+  };
+}
+
+function getImageMetaForStoredEvidence(photoValue, noteValue = "") {
+  const direct = getImageMeta(photoValue);
+  if (direct.isDataUrl) return { ...direct, hasMeta: true };
+  const fromNote = parseImageMetaFromNote(noteValue);
+  if (fromNote) return fromNote;
+  return { mime: "", width: 0, height: 0, estimated_bytes: 0, isDataUrl: false, hasMeta: false };
+}
+
+function appendPhotoStorageNote(baseNote, photoMeta = {}, storage = "INLINE", fileId = "") {
+  const parts = [norm(baseNote)];
+  const width = safeInt(photoMeta?.width, 0);
+  const height = safeInt(photoMeta?.height, 0);
+  const bytes = safeInt(photoMeta?.estimated_bytes, 0);
+  const mime = norm(photoMeta?.mime);
+  if (storage) parts.push(`PHOTO_STORAGE:${storage}`);
+  if (fileId) parts.push(`PHOTO_FILE_ID:${fileId}`);
+  if (width || height || bytes || mime) parts.push(`IMG_META:${width}x${height}|${bytes}|${mime || "application/octet-stream"}`);
+  return fitCell(parts.filter(Boolean).join(" | "));
+}
+
+function mimeExtensionFromMime(mime = "") {
+  const normalized = upper(mime);
+  if (normalized === "IMAGE/PNG") return "png";
+  if (normalized === "IMAGE/WEBP") return "webp";
+  if (normalized === "IMAGE/GIF") return "gif";
+  return "jpg";
+}
+
+function buildDrivePublicUrl(fileId) {
+  return fileId ? `https://drive.google.com/uc?export=view&id=${fileId}` : "";
+}
+
+async function getGoogleAuthClient() {
+  if (googleAuthClient) return googleAuthClient;
+  const credentials = JSON.parse(GOOGLE_SERVICE_ACCOUNT_JSON);
+  const auth = new google.auth.GoogleAuth({
+    credentials,
+    scopes: [
+      "https://www.googleapis.com/auth/spreadsheets",
+      "https://www.googleapis.com/auth/drive",
+    ],
+  });
+  googleAuthClient = await auth.getClient();
+  return googleAuthClient;
+}
+
+async function getDriveClient() {
+  if (driveClient) return driveClient;
+  const client = await getGoogleAuthClient();
+  driveClient = google.drive({ version: "v3", auth: client });
+  return driveClient;
+}
+
+async function uploadPhotoDataUrlToDrive(photoValue, photoName = "") {
+  const parsed = parseDataUrl(photoValue);
+  if (!parsed) return null;
+  const drive = await getDriveClient();
+  const extension = mimeExtensionFromMime(parsed.mime);
+  const safeName = norm(photoName) || `promobolsillo-${Date.now()}.${extension}`;
+  const requestBody = { name: safeName };
+  if (EVIDENCE_DRIVE_FOLDER_ID) requestBody.parents = [EVIDENCE_DRIVE_FOLDER_ID];
+  const createRes = await drive.files.create({
+    requestBody,
+    media: { mimeType: parsed.mime || "image/jpeg", body: Readable.from(parsed.buffer) },
+    fields: "id",
+    supportsAllDrives: true,
+  });
+  const fileId = norm(createRes.data?.id);
+  if (!fileId) return null;
+  try {
+    await drive.permissions.create({
+      fileId,
+      requestBody: { role: "reader", type: "anyone" },
+      supportsAllDrives: true,
+    });
+  } catch (error) {
+    console.warn("drive.permissions.create error", error?.message || error);
+  }
+  return { fileId, url: buildDrivePublicUrl(fileId) };
+}
+
+async function materializePhotoStorage(photoValue, photoName = "", baseNote = "") {
+  const originalLength = norm(photoValue).length;
+  const photoMeta = getImageMeta(photoValue);
+  if (norm(photoValue).startsWith("data:")) {
+    try {
+      const upload = await uploadPhotoDataUrlToDrive(photoValue, photoName);
+      if (upload?.url) {
+        return {
+          value: upload.url,
+          note: appendPhotoStorageNote(baseNote, photoMeta, "DRIVE", upload.fileId),
+          overflow: false,
+          originalLength,
+          storedExternally: true,
+        };
+      }
+    } catch (error) {
+      console.warn("materializePhotoStorage upload error", error?.message || error);
+    }
+  }
+  const normalized = normalizePhotoForSheet(photoValue);
+  return {
+    value: normalized.value,
+    note: appendPhotoStorageNote(mergeOverflowNote(baseNote, normalized), photoMeta, normalized.value.startsWith("http") ? "URL" : "INLINE", ""),
+    overflow: normalized.overflow,
+    originalLength: normalized.originalLength,
+    storedExternally: false,
+  };
+}
+
 function buildEvidencePhotoHash(photoValue, photoName = "") {
   const normalized = norm(photoValue);
   const digestInput = normalized.startsWith("data:") ? normalized : `${photoName}|${normalized.slice(0, 500)}`;
@@ -394,7 +522,9 @@ async function getActorFromRequest(req) {
 }
 
 
+let googleAuthClient = null;
 let sheetsClient = null;
+let driveClient = null;
 
 function clone2dValues(values) {
   return (values || []).map((row) => (Array.isArray(row) ? [...row] : row));
@@ -485,12 +615,7 @@ function writeActorCache(externalId, value) {
 
 async function getSheetsClient() {
   if (sheetsClient) return sheetsClient;
-  const credentials = JSON.parse(GOOGLE_SERVICE_ACCOUNT_JSON);
-  const auth = new google.auth.GoogleAuth({
-    credentials,
-    scopes: ["https://www.googleapis.com/auth/spreadsheets"],
-  });
-  const client = await auth.getClient();
+  const client = await getGoogleAuthClient();
   sheetsClient = google.sheets({ version: "v4", auth: client });
   return sheetsClient;
 }
@@ -1360,8 +1485,8 @@ async function registrarEvidenciasBatch(payloads = []) {
   let maxOriginalPhotoLength = 0;
 
   for (const payload of payloads) {
-    const photoInfo = normalizePhotoForSheet(payload.url_foto);
-    const safeNote = mergeOverflowNote(payload.note || "", photoInfo);
+    const photoInfo = await materializePhotoStorage(payload.url_foto, payload.foto_nombre || "evidencia.jpg", payload.note || "");
+    const safeNote = photoInfo.note;
     photoOverflow = photoOverflow || photoInfo.overflow;
     maxOriginalPhotoLength = Math.max(maxOriginalPhotoLength, photoInfo.originalLength || 0);
     const rowPayload = {
@@ -1408,12 +1533,12 @@ async function registrarEvidenciasBatch(payloads = []) {
 async function updateEvidenceRow(header, evidence, patch = {}) {
   const next = { ...evidence, ...patch };
   next.tipo_evidencia = canonicalEvidenceTypeLabel(next.tipo_evidencia);
-  const photoInfo = normalizePhotoForSheet(next.url_foto ?? evidence.url_foto);
+  const photoInfo = await materializePhotoStorage(next.url_foto ?? evidence.url_foto, next.foto_nombre || evidence.foto_nombre || "evidencia.jpg", next.note ?? evidence.note);
   next.url_foto = photoInfo.value;
-  next.note = mergeOverflowNote(next.note ?? evidence.note, photoInfo);
+  next.note = photoInfo.note;
   const row = buildEvidenceRowFromHeader(header, next);
   await updateSheetValues(`EVIDENCIAS!A${evidence.rowIndex}:${headerRangeEnd(header.length)}${evidence.rowIndex}`, [row]);
-  return { photoOverflow: photoInfo.overflow, originalPhotoLength: photoInfo.originalLength };
+  return { photoOverflow: photoInfo.overflow, originalPhotoLength: photoInfo.originalLength, storedExternally: photoInfo.storedExternally };
 }
 
 async function getMarcasActivas() {
@@ -2206,8 +2331,8 @@ function computeEvidencePlusAnalysis(evidence, context = {}) {
   const regla = reglas.find((rule) => evidenceTypeKey(rule.tipo_evidencia) === evidenceTypeKey(evidence.tipo_evidencia));
   const expectedPhotos = safeInt(regla?.fotos_requeridas, 1);
   const requiereFase = Boolean(regla?.requiere_antes_despues);
-  const hash = buildEvidencePhotoHash(evidence.url_foto, evidence.foto_nombre);
-  const imageMeta = getImageMeta(evidence.url_foto);
+  const hash = norm(evidence.hash_foto) || buildEvidencePhotoHash(evidence.url_foto, evidence.foto_nombre);
+  const imageMeta = getImageMetaForStoredEvidence(evidence.url_foto, evidence.note);
 
   let score = 1.0;
   const hallazgos = [];
@@ -2275,7 +2400,7 @@ function computeEvidencePlusAnalysis(evidence, context = {}) {
     alertSeverity = "ALTA";
   }
 
-  if (imageMeta.isDataUrl) {
+  if (imageMeta.hasMeta) {
     if ((imageMeta.width && imageMeta.width < EVPLUS_MIN_DIMENSION) || (imageMeta.height && imageMeta.height < EVPLUS_MIN_DIMENSION)) {
       score -= 0.15;
       hallazgos.push(`Resolución baja: ${imageMeta.width || 0}x${imageMeta.height || 0}.`);
