@@ -1509,6 +1509,138 @@ async function getReglasPorMarca(marcaId) {
   }
 }
 
+
+function normalizeComparableDateTime(value) {
+  const raw = norm(value);
+  if (!raw) return "";
+  let match = raw.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
+  if (match) {
+    const [, y, mo, d, h = "00", mi = "00", s = "00"] = match;
+    return `${y}-${mo}-${d} ${String(h).padStart(2, "0")}:${mi}:${s}`;
+  }
+  match = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?)?$/i);
+  if (match) {
+    let [, d, mo, y, h = "00", mi = "00", s = "00", ampm = ""] = match;
+    let hh = safeInt(h, 0);
+    const meridian = upper(ampm);
+    if (meridian === "PM" && hh < 12) hh += 12;
+    if (meridian === "AM" && hh === 12) hh = 0;
+    return `${y}-${String(mo).padStart(2, "0")}-${String(d).padStart(2, "0")} ${String(hh).padStart(2, "0")}:${String(mi).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  }
+  const parsed = new Date(raw);
+  if (!Number.isNaN(parsed.getTime())) {
+    return `${ymdInTZ(parsed, APP_TZ)} ${hmInTZ(parsed, APP_TZ)}:00`;
+  }
+  return "";
+}
+
+function getCurrentComparableDateTime() {
+  return `${todayISO()} ${hmInTZ(new Date(), APP_TZ)}:00`;
+}
+
+async function getGalleryAuthorizationHeader() {
+  return getSheetHeader("AUTORIZACIONES_GALERIA");
+}
+
+function parseGalleryAuthorizationRow(row, idx, header) {
+  const map = headerIndexMap(header);
+  return {
+    rowIndex: idx + 2,
+    autorizacion_id: norm(row[map.autorizacion_id]),
+    fecha_hora_solicitud: norm(row[map.fecha_hora_solicitud]),
+    fecha_hora_autorizacion: norm(row[map.fecha_hora_autorizacion]),
+    autorizado_por: norm(row[map.autorizado_por]),
+    motivo: norm(row[map.motivo]),
+    promotor_id: norm(row[map.promotor_id]),
+    external_id: norm(row[map.external_id]),
+    visita_id: norm(row[map.visita_id]),
+    tienda_id: norm(row[map.tienda_id]),
+    marca_id: norm(row[map.marca_id]),
+    tipo_evidencia: canonicalEvidenceTypeLabel(row[map.tipo_evidencia]),
+    max_fotos: safeInt(row[map.max_fotos], 0),
+    fotos_usadas: safeInt(row[map.fotos_usadas], 0),
+    vigencia_inicio: norm(row[map.vigencia_inicio]),
+    vigencia_fin: norm(row[map.vigencia_fin]),
+    estatus: upper(row[map.estatus] || ""),
+    observaciones: norm(row[map.observaciones]),
+  };
+}
+
+async function getGalleryAuthorizationRows() {
+  try {
+    const header = await getGalleryAuthorizationHeader();
+    const rows = await getSheetValues(`AUTORIZACIONES_GALERIA!A2:${headerRangeEnd(header.length)}`);
+    return { header, rows: rows.map((row, idx) => parseGalleryAuthorizationRow(row, idx, header)), error: "" };
+  } catch (error) {
+    return { header: [], rows: [], error: error?.message || String(error) };
+  }
+}
+
+function galleryFieldMatches(expected, actual) {
+  const a = norm(actual);
+  const e = norm(expected);
+  if (!e) return true;
+  return upper(e) === upper(a);
+}
+
+async function resolveGalleryAuthorization(params = {}) {
+  const pack = await getGalleryAuthorizationRows();
+  const currentTs = getCurrentComparableDateTime();
+  const debug = {
+    now_local: currentTs,
+    rows_scanned: pack.rows.length,
+    sheet_error: pack.error || "",
+    reason: "NO_MATCH",
+  };
+  if (pack.error) {
+    debug.reason = "SHEET_ERROR";
+    return { allowed: false, debug };
+  }
+  for (const row of pack.rows) {
+    if (upper(row.estatus) !== "ACTIVA") continue;
+    if (row.promotor_id && upper(row.promotor_id) !== upper(params.promotor_id)) continue;
+    if (row.external_id && upper(row.external_id) !== upper(params.external_id)) continue;
+    if (row.visita_id && upper(row.visita_id) !== upper(params.visita_id)) continue;
+    if (row.tienda_id && upper(row.tienda_id) != upper(params.tienda_id)) continue;
+    if (row.marca_id && upper(row.marca_id) !== upper(params.marca_id)) continue;
+    if (row.tipo_evidencia && evidenceTypeKey(row.tipo_evidencia) !== evidenceTypeKey(params.tipo_evidencia)) continue;
+    const start = normalizeComparableDateTime(row.vigencia_inicio);
+    const end = normalizeComparableDateTime(row.vigencia_fin);
+    if (start && currentTs < start) {
+      debug.reason = "OUTSIDE_WINDOW_BEFORE";
+      continue;
+    }
+    if (end && currentTs > end) {
+      debug.reason = "OUTSIDE_WINDOW_AFTER";
+      continue;
+    }
+    if (safeInt(row.max_fotos, 0) > 0 && safeInt(row.fotos_usadas, 0) >= safeInt(row.max_fotos, 0)) {
+      debug.reason = "MAX_REACHED";
+      continue;
+    }
+    debug.reason = "MATCH";
+    debug.autorizacion_id = row.autorizacion_id;
+    return { allowed: true, row, debug };
+  }
+  return { allowed: false, debug };
+}
+
+async function consumeGalleryAuthorization(row, quantity = 1) {
+  if (!row?.autorizacion_id) return false;
+  const header = await getGalleryAuthorizationHeader();
+  const nextUsed = safeInt(row.fotos_usadas, 0) + Math.max(1, safeInt(quantity, 1));
+  const nextStatus = safeInt(row.max_fotos, 0) > 0 && nextUsed >= safeInt(row.max_fotos, 0) ? "AGOTADA" : row.estatus || "ACTIVA";
+  const values = new Array(header.length).fill("");
+  header.forEach((name, idx) => {
+    const key = norm(name);
+    values[idx] = row[key] != null ? row[key] : "";
+    if (key === "fotos_usadas") values[idx] = String(nextUsed);
+    if (key === "estatus") values[idx] = nextStatus;
+  });
+  await updateSheetValues(`AUTORIZACIONES_GALERIA!A${row.rowIndex}:${headerRangeEnd(header.length)}${row.rowIndex}`, [values]);
+  return true;
+}
+
 async function getAsignacionesActivas() {
   const rows = await getSheetValues("ASIGNACIONES!A2:D");
   return rows
@@ -1616,155 +1748,6 @@ async function getTiendaMarcasActivasByTiendaId(tiendaId) {
   return rows
     .filter((row) => norm(row[0]) === tiendaId && isTrue(row[2] ?? "TRUE"))
     .map((row) => ({ tienda_id: norm(row[0]), marca_id: norm(row[1]), activa: true, observaciones: norm(row[3]) }));
-}
-
-function parseGalleryAuthorizationRow(row, idx) {
-  return {
-    rowIndex: idx + 2,
-    autorizacion_id: norm(row[0]),
-    fecha_hora_solicitud: norm(row[1]),
-    fecha_hora_autorizacion: norm(row[2]),
-    autorizado_por: norm(row[3]),
-    motivo: norm(row[4]),
-    promotor_id: norm(row[5]),
-    external_id: norm(row[6]),
-    visita_id: norm(row[7]),
-    tienda_id: norm(row[8]),
-    marca_id: norm(row[9]),
-    tipo_evidencia: canonicalEvidenceTypeLabel(row[10]),
-    max_fotos: safeInt(row[11], 1),
-    fotos_usadas: safeInt(row[12], 0),
-    vigencia_inicio: norm(row[13]),
-    vigencia_fin: norm(row[14]),
-    estatus: upper(row[15] || "ACTIVA"),
-    observaciones: norm(row[16]),
-  };
-}
-
-function buildGalleryAuthorizationRow(auth) {
-  return [
-    auth.autorizacion_id || "",
-    auth.fecha_hora_solicitud || "",
-    auth.fecha_hora_autorizacion || "",
-    auth.autorizado_por || "",
-    auth.motivo || "",
-    auth.promotor_id || "",
-    auth.external_id || "",
-    auth.visita_id || "",
-    auth.tienda_id || "",
-    auth.marca_id || "",
-    auth.tipo_evidencia || "",
-    String(auth.max_fotos || 1),
-    String(auth.fotos_usadas || 0),
-    auth.vigencia_inicio || "",
-    auth.vigencia_fin || "",
-    auth.estatus || "ACTIVA",
-    auth.observaciones || "",
-  ];
-}
-
-function parseTimeMs(value) {
-  if (!value) return 0;
-  const ms = new Date(value).getTime();
-  return Number.isFinite(ms) ? ms : 0;
-}
-
-function isGalleryAuthorizationStatusActive(status) {
-  return ["ACTIVA", "ACTIVE", "AUTORIZADA", "AUTHORIZED"].includes(upper(status || ""));
-}
-
-function galleryAuthorizationMatches(auth, criteria = {}) {
-  const requestedCount = Math.max(1, safeInt(criteria.requested_count, 1));
-  if (!isGalleryAuthorizationStatusActive(auth.estatus)) return false;
-  if (auth.promotor_id && auth.promotor_id !== norm(criteria.promotor_id)) return false;
-  if (auth.external_id && auth.external_id !== norm(criteria.external_id)) return false;
-  if (auth.visita_id && auth.visita_id !== norm(criteria.visita_id)) return false;
-  if (auth.tienda_id && auth.tienda_id !== norm(criteria.tienda_id)) return false;
-  if (auth.marca_id && upper(auth.marca_id) !== upper(criteria.marca_id || "")) return false;
-  if (auth.tipo_evidencia && evidenceTypeKey(auth.tipo_evidencia) !== evidenceTypeKey(criteria.tipo_evidencia || "")) return false;
-  const nowMs = Date.now();
-  const startMs = parseTimeMs(auth.vigencia_inicio);
-  const endMs = parseTimeMs(auth.vigencia_fin);
-  if (startMs && nowMs < startMs) return false;
-  if (endMs && nowMs > endMs) return false;
-  const maxFotos = Math.max(1, safeInt(auth.max_fotos, 1));
-  const fotosUsadas = Math.max(0, safeInt(auth.fotos_usadas, 0));
-  if (maxFotos > 0 && fotosUsadas + requestedCount > maxFotos) return false;
-  return true;
-}
-
-function formatGalleryAuthorizationSummary(auth) {
-  if (!auth) return null;
-  const maxFotos = Math.max(1, safeInt(auth.max_fotos, 1));
-  const fotosUsadas = Math.max(0, safeInt(auth.fotos_usadas, 0));
-  return {
-    authorization_id: auth.autorizacion_id,
-    autorizado_por: auth.autorizado_por,
-    motivo: auth.motivo,
-    vigencia_fin: auth.vigencia_fin,
-    max_fotos: maxFotos,
-    fotos_restantes: Math.max(0, maxFotos - fotosUsadas),
-  };
-}
-
-function buildGalleryAuthorizationNote(baseNote, auth) {
-  const parts = [
-    norm(baseNote),
-    auth?.autorizacion_id ? `GALERIA_AUTORIZADA:${auth.autorizacion_id}` : "",
-    auth?.motivo ? `MOTIVO:${auth.motivo}` : "",
-    auth?.autorizado_por ? `AUTORIZADO_POR:${auth.autorizado_por}` : "",
-  ].filter(Boolean);
-  return fitCell(parts.join(" | "));
-}
-
-async function getGalleryAuthorizationsAll() {
-  try {
-    const rows = await getSheetValues("AUTORIZACIONES_GALERIA!A2:Q");
-    return rows.map((row, idx) => parseGalleryAuthorizationRow(row, idx));
-  } catch {
-    return [];
-  }
-}
-
-async function findGalleryAuthorization(criteria = {}) {
-  const rows = await getGalleryAuthorizationsAll();
-  const matches = rows.filter((row) => galleryAuthorizationMatches(row, criteria));
-  if (!matches.length) return null;
-  matches.sort((a, b) => {
-    const aTime = parseTimeMs(a.fecha_hora_autorizacion) || parseTimeMs(a.vigencia_fin) || 0;
-    const bTime = parseTimeMs(b.fecha_hora_autorizacion) || parseTimeMs(b.vigencia_fin) || 0;
-    return bTime - aTime;
-  });
-  return matches[0];
-}
-
-async function consumeGalleryAuthorization(auth, usedCount = 1) {
-  if (!auth?.rowIndex) return auth;
-  const maxFotos = Math.max(1, safeInt(auth.max_fotos, 1));
-  const fotosUsadas = Math.max(0, safeInt(auth.fotos_usadas, 0));
-  const nextUsed = fotosUsadas + Math.max(1, safeInt(usedCount, 1));
-  const next = {
-    ...auth,
-    fotos_usadas: nextUsed,
-    estatus: nextUsed >= maxFotos ? "AGOTADA" : auth.estatus,
-  };
-  await updateSheetValues(`AUTORIZACIONES_GALERIA!A${auth.rowIndex}:Q${auth.rowIndex}`, [buildGalleryAuthorizationRow(next)]);
-  return next;
-}
-
-async function resolveGalleryAuthorizationCriteriaFromEvidence(evidenciaId) {
-  const found = await getEvidenceById(evidenciaId);
-  if (!found) return null;
-  const visit = found.evidence.visita_id ? await getVisitById(found.evidence.visita_id) : null;
-  return {
-    evidence: found.evidence,
-    criteria: {
-      visita_id: found.evidence.visita_id,
-      tienda_id: visit?.tienda_id || "",
-      marca_id: found.evidence.marca_id || "",
-      tipo_evidencia: found.evidence.tipo_evidencia || "",
-    },
-  };
 }
 
 async function getTareasVisitaHeader() {
@@ -3070,6 +3053,45 @@ external_id: telegram:${incoming.fromId}`
   }
 });
 
+
+app.post("/miniapp/promotor/gallery-authorization", async (req, res) => {
+  try {
+    const { actor } = await getActorFromRequest(req);
+    if (actor.role !== "promotor") return res.status(403).json({ ok: false, error: "Solo promotor" });
+    const mode = norm(req.body?.mode || "evidencia");
+    const visitaId = norm(req.body?.visita_id);
+    const tiendaId = norm(req.body?.tienda_id);
+    const marcaId = norm(req.body?.marca_id);
+    const tipoEvidencia = canonicalEvidenceTypeLabel(req.body?.tipo_evidencia);
+    const found = await resolveGalleryAuthorization({
+      promotor_id: actor.profile.promotor_id,
+      external_id: actor.profile.external_id,
+      visita_id: visitaId,
+      tienda_id: tiendaId,
+      marca_id: marcaId,
+      tipo_evidencia: tipoEvidencia,
+      mode,
+    });
+    return res.json({
+      ok: true,
+      allowed: found.allowed,
+      mode,
+      authorization: found.row ? {
+        autorizacion_id: found.row.autorizacion_id,
+        motivo: found.row.motivo,
+        autorizado_por: found.row.autorizado_por,
+        vigencia_inicio: found.row.vigencia_inicio,
+        vigencia_fin: found.row.vigencia_fin,
+        max_fotos: found.row.max_fotos,
+        fotos_usadas: found.row.fotos_usadas,
+      } : null,
+      debug: found.debug,
+    });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message || "No se pudo validar la autorización de galería." });
+  }
+});
+
 app.post("/miniapp/bootstrap", async (req, res) => {
   try {
     const { actor, validated } = await getActorFromRequest(req);
@@ -3243,33 +3265,6 @@ app.post("/miniapp/promotor/evidence-rules", async (req, res) => {
   }
 });
 
-app.post("/miniapp/promotor/gallery-authorization", async (req, res) => {
-  try {
-    const { actor } = await getActorFromRequest(req);
-    if (actor.role !== "promotor") return res.status(403).json({ ok: false, error: "Solo promotor" });
-    const scope = norm(req.body?.scope || "evidencia");
-    const evidenciaId = norm(req.body?.evidencia_id);
-    let criteria = {
-      promotor_id: actor.profile.promotor_id,
-      external_id: actor.profile.external_id,
-      visita_id: norm(req.body?.visita_id),
-      tienda_id: norm(req.body?.tienda_id),
-      marca_id: norm(req.body?.marca_id),
-      tipo_evidencia: canonicalEvidenceTypeLabel(req.body?.tipo_evidencia || (scope === "entrada" ? "ASISTENCIA" : "")),
-      requested_count: 1,
-    };
-    if (evidenciaId) {
-      const resolved = await resolveGalleryAuthorizationCriteriaFromEvidence(evidenciaId);
-      if (resolved) criteria = { ...criteria, ...resolved.criteria };
-    }
-    const auth = await findGalleryAuthorization(criteria);
-    if (!auth) return res.json({ ok: true, allowed: false, reason: "No hay autorización activa de Operaciones para usar galería." });
-    return res.json({ ok: true, allowed: true, authorization: formatGalleryAuthorizationSummary(auth) });
-  } catch (error) {
-    return res.status(500).json({ ok: false, error: error.message || "gallery authorization error" });
-  }
-});
-
 app.post("/miniapp/promotor/start-entry", async (req, res) => {
   try {
     const { actor } = await getActorFromRequest(req);
@@ -3280,24 +3275,9 @@ app.post("/miniapp/promotor/start-entry", async (req, res) => {
     const accuracy = safeNum(req.body?.accuracy, 0);
     const fotoNombre = norm(req.body?.foto_nombre || "entrada.jpg");
     const fotoDataUrl = norm(req.body?.foto_data_url);
-    const fotoSource = upper(req.body?.foto_source || "CAMARA");
+    const source = upper(req.body?.source || "CAMARA");
     if (!tiendaId) return res.status(400).json({ ok: false, error: "tienda_id requerido" });
     if (!fotoDataUrl) return res.status(400).json({ ok: false, error: "foto requerida" });
-
-    let galleryAuthorization = null;
-    if (fotoSource.includes("GALERIA")) {
-      galleryAuthorization = await findGalleryAuthorization({
-        promotor_id: actor.profile.promotor_id,
-        external_id: actor.profile.external_id,
-        tienda_id: tiendaId,
-        tipo_evidencia: "ASISTENCIA",
-        requested_count: 1,
-      });
-      if (!galleryAuthorization) {
-        return res.status(403).json({ ok: false, error: "El uso de galería para asistencia no está autorizado por Operaciones." });
-      }
-      galleryAuthorization = await consumeGalleryAuthorization(galleryAuthorization, 1);
-    }
 
     const tiendaMap = await getTiendaMap();
     const existingOpenVisit = (await getOpenVisitsToday(actor.profile.promotor_id)).find((item) => item.tienda_id === tiendaId);
@@ -3310,6 +3290,21 @@ app.post("/miniapp/promotor/start-entry", async (req, res) => {
       });
     }
 
+    let galleryAuthorization = null;
+    if (source === "GALERIA_AUTORIZADA") {
+      galleryAuthorization = await resolveGalleryAuthorization({
+        promotor_id: actor.profile.promotor_id,
+        external_id: actor.profile.external_id,
+        tienda_id: tiendaId,
+        visita_id: "",
+        marca_id: "",
+        tipo_evidencia: "ASISTENCIA",
+      });
+      if (!galleryAuthorization.allowed) {
+        return res.status(403).json({ ok: false, error: `Galería no autorizada para asistencia. Motivo: ${galleryAuthorization.debug?.reason || "SIN_AUTORIZACION"}` });
+      }
+    }
+
     const geofence = await buildGeofenceContext(tiendaId, lat, lon, accuracy);
     const planRow = await findPlaneacionForVisit(todayISO(), actor.profile.promotor_id, tiendaId);
     const visitId = await createVisitWithGeofence(actor.profile.promotor_id, tiendaId, "Registro de entrada", geofence);
@@ -3319,7 +3314,7 @@ app.post("/miniapp/promotor/start-entry", async (req, res) => {
       external_id: actor.profile.external_id,
       fecha_hora: nowISO(),
       tipo_evento: "ASISTENCIA_ENTRADA",
-      origen: fotoSource.includes("GALERIA") ? "ASISTENCIA_GALERIA_AUTORIZADA" : "ASISTENCIA",
+      origen: source === "GALERIA_AUTORIZADA" ? "ASISTENCIA_GALERIA_AUTORIZADA" : "ASISTENCIA",
       jornada_id: "",
       visita_id: visitId,
       url_foto: fotoDataUrl,
@@ -3333,7 +3328,7 @@ app.post("/miniapp/promotor/start-entry", async (req, res) => {
       tipo_evidencia: "ASISTENCIA",
       descripcion: "[TELEGRAM_MINIAPP_ENTRADA]",
       status: "ACTIVA",
-      note: fotoSource.includes("GALERIA") ? buildGalleryAuthorizationNote("", galleryAuthorization) : "",
+      note: source === "GALERIA_AUTORIZADA" && galleryAuthorization?.row ? `AUTORIZACION_GALERIA:${galleryAuthorization.row.autorizacion_id}|${galleryAuthorization.row.autorizado_por}|${galleryAuthorization.row.motivo}` : "",
       fase: "NA",
       foto_nombre: fotoNombre,
       accuracy: String(accuracy || ""),
@@ -3350,6 +3345,9 @@ app.post("/miniapp/promotor/start-entry", async (req, res) => {
     }
     if (upper(geofence.resultado) === "FUERA_DE_GEOCERCA") {
       await createGeofenceAlertIfNeeded(visitId, actor.profile, tiendaId, "GEOCERCA_ENTRADA", geofence, evidenceId);
+    }
+    if (galleryAuthorization?.row) {
+      await consumeGalleryAuthorization(galleryAuthorization.row, 1);
     }
     return res.json({
       ok: true,
@@ -3412,8 +3410,8 @@ app.post("/miniapp/promotor/evidence-register", async (req, res) => {
     const tipoEvidencia = canonicalEvidenceTypeLabel(req.body?.tipo_evidencia);
     const fase = norm(req.body?.fase || "NA") || "NA";
     const descripcion = norm(req.body?.descripcion);
+    const source = upper(req.body?.source || "CAMARA");
     const fotos = Array.isArray(req.body?.fotos) ? req.body.fotos : [];
-    const galleryPhotos = fotos.filter((photo) => upper(photo?.source || "").includes("GALERIA"));
     const visit = await getVisitById(visitaId);
     if (!visit || visit.promotor_id !== actor.profile.promotor_id) return res.status(404).json({ ok: false, error: "Visita no encontrada" });
     if (!tipoEvidencia) return res.status(400).json({ ok: false, error: "tipo_evidencia requerido" });
@@ -3421,20 +3419,18 @@ app.post("/miniapp/promotor/evidence-register", async (req, res) => {
 
     const marcaId = marcaIdRaw || (await resolveMarcaIdByName(marcaNombreRaw));
     let galleryAuthorization = null;
-    if (galleryPhotos.length) {
-      galleryAuthorization = await findGalleryAuthorization({
+    if (source === "GALERIA_AUTORIZADA") {
+      galleryAuthorization = await resolveGalleryAuthorization({
         promotor_id: actor.profile.promotor_id,
         external_id: actor.profile.external_id,
         visita_id: visitaId,
         tienda_id: visit.tienda_id,
         marca_id: marcaId,
         tipo_evidencia: tipoEvidencia,
-        requested_count: galleryPhotos.length,
       });
-      if (!galleryAuthorization) {
-        return res.status(403).json({ ok: false, error: "El uso de galería para esta evidencia no está autorizado por Operaciones." });
+      if (!galleryAuthorization.allowed) {
+        return res.status(403).json({ ok: false, error: `Galería no autorizada para evidencia. Motivo: ${galleryAuthorization.debug?.reason || "SIN_AUTORIZACION"}` });
       }
-      galleryAuthorization = await consumeGalleryAuthorization(galleryAuthorization, galleryPhotos.length);
     }
 
     if (upper(fase) === "DESPUES" && marcaId) {
@@ -3464,13 +3460,12 @@ app.post("/miniapp/promotor/evidence-register", async (req, res) => {
       created.push(evidenceId);
       const photoName = fitCell(norm(photo?.name || "evidencia.jpg"));
       const photoValue = norm(photo?.dataUrl || photo?.url || "");
-      const isGallerySource = upper(photo?.source || "").includes("GALERIA");
       return {
         evidencia_id: evidenceId,
         external_id: actor.profile.external_id,
         fecha_hora: nowISO(),
         tipo_evento: "EVIDENCIA_OPERATIVA",
-        origen: isGallerySource ? "OPERACION_GALERIA_AUTORIZADA" : "OPERACION",
+        origen: source === "GALERIA_AUTORIZADA" ? "OPERACION_GALERIA_AUTORIZADA" : "OPERACION",
         jornada_id: "",
         visita_id: visitaId,
         url_foto: photoValue,
@@ -3483,12 +3478,12 @@ app.post("/miniapp/promotor/evidence-register", async (req, res) => {
         producto_id: "",
         tipo_evidencia: tipoEvidencia,
         descripcion,
-        status: isGallerySource ? "PENDIENTE_REVISION" : "RECIBIDA",
-        note: isGallerySource ? buildGalleryAuthorizationNote("", galleryAuthorization) : "",
+        status: source === "GALERIA_AUTORIZADA" ? "PENDIENTE_REVISION" : "RECIBIDA",
+        note: source === "GALERIA_AUTORIZADA" && galleryAuthorization?.row ? `AUTORIZACION_GALERIA:${galleryAuthorization.row.autorizacion_id}|${galleryAuthorization.row.autorizado_por}|${galleryAuthorization.row.motivo}` : "",
         fase,
         foto_nombre: photoName,
         accuracy: "",
-        requiere_revision_supervisor: isGallerySource ? "TRUE" : "FALSE",
+        requiere_revision_supervisor: source === "GALERIA_AUTORIZADA" ? "TRUE" : "FALSE",
         revisado_por: "",
         fecha_revision: "",
         decision_supervisor: "",
@@ -3507,6 +3502,9 @@ app.post("/miniapp/promotor/evidence-register", async (req, res) => {
     try {
       scheduleEvidenceGroupAnalysis({ visitaId, marcaId, tipoEvidencia, fase });
       scheduleVisitTaskRecalculation(visitaId);
+      if (galleryAuthorization?.row) {
+        await consumeGalleryAuthorization(galleryAuthorization.row, fotos.length);
+      }
     } catch (postprocessError) {
       console.warn("evidence-register postprocess warning", postprocessError?.message || postprocessError);
       warnings.push(postprocessError?.message || "postprocess_warning");
@@ -3541,6 +3539,9 @@ app.post("/miniapp/promotor/cancel-evidence", async (req, res) => {
       status: "ANULADA",
       note: note ? `${found.evidence.note ? `${found.evidence.note} | ` : ""}${note}` : found.evidence.note,
     });
+    if (galleryAuthorization?.row) {
+      await consumeGalleryAuthorization(galleryAuthorization.row, 1);
+    }
     if (upper(found.evidence.tipo_evidencia) !== "ASISTENCIA") {
       scheduleEvidenceGroupAnalysis({
         visitaId: found.evidence.visita_id,
@@ -3563,32 +3564,29 @@ app.post("/miniapp/promotor/replace-evidence", async (req, res) => {
     const evidenciaId = norm(req.body?.evidencia_id);
     const fotoNombre = norm(req.body?.foto_nombre || "reemplazo.jpg");
     const fotoDataUrl = norm(req.body?.foto_data_url);
-    const fotoSource = upper(req.body?.foto_source || "CAMARA");
+    const source = upper(req.body?.source || "CAMARA");
     const found = await getEvidenceById(evidenciaId);
     if (!found) return res.status(404).json({ ok: false, error: "Evidencia no encontrada" });
     if (found.evidence.external_id !== actor.profile.external_id) return res.status(403).json({ ok: false, error: "No autorizada" });
     let galleryAuthorization = null;
-    if (fotoSource.includes("GALERIA")) {
-      const visit = found.evidence.visita_id ? await getVisitById(found.evidence.visita_id) : null;
-      galleryAuthorization = await findGalleryAuthorization({
+    if (source === "GALERIA_AUTORIZADA") {
+      const visit = await getVisitById(found.evidence.visita_id);
+      galleryAuthorization = await resolveGalleryAuthorization({
         promotor_id: actor.profile.promotor_id,
         external_id: actor.profile.external_id,
         visita_id: found.evidence.visita_id,
         tienda_id: visit?.tienda_id || "",
         marca_id: found.evidence.marca_id,
         tipo_evidencia: found.evidence.tipo_evidencia,
-        requested_count: 1,
       });
-      if (!galleryAuthorization) {
-        return res.status(403).json({ ok: false, error: "El uso de galería para reemplazar esta evidencia no está autorizado por Operaciones." });
+      if (!galleryAuthorization.allowed) {
+        return res.status(403).json({ ok: false, error: `Galería no autorizada para reemplazo. Motivo: ${galleryAuthorization.debug?.reason || "SIN_AUTORIZACION"}` });
       }
-      galleryAuthorization = await consumeGalleryAuthorization(galleryAuthorization, 1);
     }
     const result = await updateEvidenceRow(found.header, found.evidence, {
       url_foto: fotoDataUrl,
       foto_nombre: fotoNombre,
-      origen: fotoSource.includes("GALERIA") ? "OPERACION_GALERIA_AUTORIZADA" : found.evidence.origen,
-      note: fotoSource.includes("GALERIA") ? buildGalleryAuthorizationNote(found.evidence.note, galleryAuthorization) : found.evidence.note,
+      origen: source === "GALERIA_AUTORIZADA" ? "OPERACION_GALERIA_AUTORIZADA" : found.evidence.origen,
       resultado_ai: "Pendiente",
       score_confianza: "",
       riesgo: "BAJO",
@@ -3597,9 +3595,13 @@ app.post("/miniapp/promotor/replace-evidence", async (req, res) => {
       analizado_at: "",
       version_motor_ai: "",
       hash_foto: buildEvidencePhotoHash(fotoDataUrl, fotoNombre),
-      status: fotoSource.includes("GALERIA") ? "PENDIENTE_REVISION" : found.evidence.status,
-      requiere_revision_supervisor: fotoSource.includes("GALERIA") ? "TRUE" : "FALSE",
+      requiere_revision_supervisor: source === "GALERIA_AUTORIZADA" ? "TRUE" : "FALSE",
+      status: source === "GALERIA_AUTORIZADA" ? "PENDIENTE_REVISION" : found.evidence.status,
+      note: source === "GALERIA_AUTORIZADA" && galleryAuthorization?.row ? `AUTORIZACION_GALERIA:${galleryAuthorization.row.autorizacion_id}|${galleryAuthorization.row.autorizado_por}|${galleryAuthorization.row.motivo}` : found.evidence.note,
     });
+    if (galleryAuthorization?.row) {
+      await consumeGalleryAuthorization(galleryAuthorization.row, 1);
+    }
     if (upper(found.evidence.tipo_evidencia) !== "ASISTENCIA") {
       scheduleEvidenceGroupAnalysis({
         visitaId: found.evidence.visita_id,
