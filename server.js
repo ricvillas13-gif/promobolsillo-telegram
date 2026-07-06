@@ -12,6 +12,7 @@ const {
   TELEGRAM_BOT_TOKEN,
   MINIAPP_BASE_URL,
   PUBLIC_BASE_URL,
+  OPS_TOKEN,
   GOOGLE_DRIVE_EVIDENCE_FOLDER_ID,
   DRIVE_EVIDENCE_FOLDER_ID,
 } = process.env;
@@ -47,7 +48,7 @@ app.use((req, res, next) => {
     res.header("Access-Control-Allow-Origin", origin);
   }
   res.header("Vary", "Origin");
-  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, x-telegram-init-data");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, x-telegram-init-data, x-ops-token");
   res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
@@ -73,6 +74,29 @@ function safeInt(value, fallback = 0) {
 
 function isTrue(value) {
   return ["TRUE", "1", "SI", "SÍ", "YES", "VERDADERO"].includes(upper(value));
+}
+
+function firstMappedValue(row, map, keys = []) {
+  for (const key of keys) {
+    const idx = map?.[key];
+    if (idx == null || idx < 0) continue;
+    const value = row[idx];
+    if (value !== undefined && value !== null && String(value).trim() !== "") return value;
+  }
+  return "";
+}
+
+function requireOpsToken(req, res, next) {
+  const configuredToken = norm(OPS_TOKEN);
+  if (!configuredToken) {
+    console.warn("WARN: OPS_TOKEN no configurado; endpoint /ops permitido temporalmente.");
+    return next();
+  }
+  const providedToken = norm(req.headers["x-ops-token"] || req.body?.ops_token || req.query?.ops_token);
+  if (providedToken !== configuredToken) {
+    return res.status(401).json({ ok: false, error: "OPS_TOKEN requerido o invalido" });
+  }
+  return next();
 }
 
 function unique(arr) {
@@ -1371,7 +1395,15 @@ function buildEvidenceRowFromHeader(header, payload) {
   const row = new Array(header.length).fill("");
   header.forEach((name, idx) => {
     const key = norm(name);
-    row[idx] = payload[key] != null ? payload[key] : "";
+    if (payload[key] != null) {
+      row[idx] = payload[key];
+    } else if (key === "requiere_fase" && payload.requiere_antes_despues != null) {
+      row[idx] = payload.requiere_antes_despues;
+    } else if (key === "requiere_antes_despues" && payload.requiere_fase != null) {
+      row[idx] = payload.requiere_fase;
+    } else {
+      row[idx] = "";
+    }
   });
   return row;
 }
@@ -1796,7 +1828,15 @@ function buildPlaneacionRowFromHeader(header, payload) {
   const row = new Array(header.length).fill("");
   header.forEach((name, idx) => {
     const key = norm(name);
-    row[idx] = payload[key] != null ? payload[key] : "";
+    if (payload[key] != null) {
+      row[idx] = payload[key];
+    } else if (key === "requiere_fase" && payload.requiere_antes_despues != null) {
+      row[idx] = payload.requiere_antes_despues;
+    } else if (key === "requiere_antes_despues" && payload.requiere_fase != null) {
+      row[idx] = payload.requiere_fase;
+    } else {
+      row[idx] = "";
+    }
   });
   return row;
 }
@@ -1892,7 +1932,7 @@ function parseTareaVisitaRow(row, idx, header) {
     marca_id: norm(row[map.marca_id]),
     tipo_evidencia: canonicalEvidenceTypeLabel(row[map.tipo_evidencia]),
     fotos_requeridas: safeInt(row[map.fotos_requeridas], 0),
-    requiere_antes_despues: isTrue(row[map.requiere_antes_despues]),
+    requiere_antes_despues: isTrue(firstMappedValue(row, map, ["requiere_antes_despues", "requiere_fase"])),
     estatus: upper(row[map.estatus] || "PENDIENTE"),
     total_fotos_cargadas: safeInt(row[map.total_fotos_cargadas], 0),
     alerta_generada: upper(row[map.alerta_generada] || "FALSE"),
@@ -1904,7 +1944,15 @@ function buildTareaVisitaRowFromHeader(header, payload) {
   const row = new Array(header.length).fill("");
   header.forEach((name, idx) => {
     const key = norm(name);
-    row[idx] = payload[key] != null ? payload[key] : "";
+    if (payload[key] != null) {
+      row[idx] = payload[key];
+    } else if (key === "requiere_fase" && payload.requiere_antes_despues != null) {
+      row[idx] = payload.requiere_antes_despues;
+    } else if (key === "requiere_antes_despues" && payload.requiere_fase != null) {
+      row[idx] = payload.requiere_fase;
+    } else {
+      row[idx] = "";
+    }
   });
   return row;
 }
@@ -4071,7 +4119,7 @@ app.post("/miniapp/promotor/alerts-recent", async (req, res) => {
   }
 });
 
-app.post("/ops/planeacion/generate-range", async (req, res) => {
+app.post("/ops/planeacion/generate-range", requireOpsToken, async (req, res) => {
   try {
     const start_date = norm(req.body?.start_date || todayISO());
     const end_date = norm(req.body?.end_date || start_date);
@@ -4083,7 +4131,7 @@ app.post("/ops/planeacion/generate-range", async (req, res) => {
   }
 });
 
-app.post("/ops/compliance/run-close", async (req, res) => {
+app.post("/ops/compliance/run-close", requireOpsToken, async (req, res) => {
   try {
     const date = norm(req.body?.date || todayISO());
     const result = await runDailyComplianceClose(date);
@@ -4093,7 +4141,7 @@ app.post("/ops/compliance/run-close", async (req, res) => {
   }
 });
 
-app.post("/ops/tareas/rebuild-visita", async (req, res) => {
+app.post("/ops/tareas/rebuild-visita", requireOpsToken, async (req, res) => {
   try {
     const visita_id = norm(req.body?.visita_id);
     if (!visita_id) return res.status(400).json({ ok: false, error: "visita_id requerido" });
