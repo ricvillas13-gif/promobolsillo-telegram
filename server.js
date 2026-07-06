@@ -26,7 +26,7 @@ app.use(bodyParser.urlencoded({ extended: false, limit: "35mb" }));
 
 const TELEGRAM_API = TELEGRAM_BOT_TOKEN ? `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}` : "";
 const EVPLUS_VERSION = "EVPLUS_V1";
-const PROMOBOLSILLO_DEPLOY_VERSION = "E008_DRIVE_DIAGNOSTICS_SCROLL_TABS";
+const PROMOBOLSILLO_DEPLOY_VERSION = "E009B_DEMO_INLINE_COMPRESSED_STORAGE";
 const EVPLUS_MIN_DIMENSION = 420;
 const EVPLUS_MIN_ESTIMATED_BYTES = 9000;
 const PHOTO_CELL_LIMIT = 48000;
@@ -454,14 +454,17 @@ async function materializePhotoStorage(photoValue, photoName = "", baseNote = ""
     } catch (error) {
       const driveError = sanitizeDriveError(error);
       console.warn("materializePhotoStorage upload error", driveError);
+      const demoFallback = normalizePhotoForSheet(photoValue, "[IMAGE_TOO_LARGE_FOR_SHEETS]");
+      const demoStorage = demoFallback.value.startsWith("data:") ? "INLINE_DEMO" : "INLINE_DEMO_FAILED";
       return {
-        value: "[DRIVE_UPLOAD_FAILED]",
-        note: appendDriveErrorNote(appendPhotoStorageNote(baseNote, photoMeta, "DRIVE_FAILED", ""), driveError),
-        overflow: false,
+        value: demoFallback.value,
+        note: appendDriveErrorNote(appendPhotoStorageNote(mergeOverflowNote(baseNote, demoFallback), photoMeta, demoStorage, ""), driveError),
+        overflow: demoFallback.overflow,
         originalLength,
         storedExternally: false,
         driveUploadFailed: true,
         driveUploadError: driveError,
+        demoInlineFallback: demoStorage === "INLINE_DEMO",
       };
     }
   }
@@ -3243,6 +3246,7 @@ app.get("/health", async (_req, res) => {
     version: PROMOBOLSILLO_DEPLOY_VERSION,
     now: nowISO(),
     drive_evidence_folder_configured: !!EVIDENCE_DRIVE_FOLDER_ID,
+    demo_inline_fallback_enabled: true,
   });
 });
 
