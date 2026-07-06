@@ -26,6 +26,7 @@ app.use(bodyParser.urlencoded({ extended: false, limit: "35mb" }));
 
 const TELEGRAM_API = TELEGRAM_BOT_TOKEN ? `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}` : "";
 const EVPLUS_VERSION = "EVPLUS_V1";
+const PROMOBOLSILLO_DEPLOY_VERSION = "E008_DRIVE_DIAGNOSTICS_SCROLL_TABS";
 const EVPLUS_MIN_DIMENSION = 420;
 const EVPLUS_MIN_ESTIMATED_BYTES = 9000;
 const PHOTO_CELL_LIMIT = 48000;
@@ -372,6 +373,20 @@ function buildDrivePublicUrl(fileId) {
   return fileId ? `https://drive.google.com/uc?export=view&id=${fileId}` : "";
 }
 
+function sanitizeDriveError(error) {
+  const raw = [
+    error?.message,
+    error?.response?.data?.error?.message,
+    Array.isArray(error?.errors) ? error.errors.map((item) => item?.message).join(" | ") : "",
+  ].filter(Boolean).join(" | ") || "DRIVE_UPLOAD_ERROR";
+  return fitCell(raw.replace(/private_key[^|]+/ig, "private_key:[redacted]").slice(0, 240));
+}
+
+function appendDriveErrorNote(baseNote, driveError) {
+  const pieces = [norm(baseNote), `DRIVE_ERROR:${sanitizeDriveError(driveError)}`].filter(Boolean);
+  return fitCell(pieces.join(" | "));
+}
+
 async function getGoogleAuthClient() {
   if (googleAuthClient) return googleAuthClient;
   const credentials = JSON.parse(GOOGLE_SERVICE_ACCOUNT_JSON);
@@ -437,7 +452,17 @@ async function materializePhotoStorage(photoValue, photoName = "", baseNote = ""
         };
       }
     } catch (error) {
-      console.warn("materializePhotoStorage upload error", error?.message || error);
+      const driveError = sanitizeDriveError(error);
+      console.warn("materializePhotoStorage upload error", driveError);
+      return {
+        value: "[DRIVE_UPLOAD_FAILED]",
+        note: appendDriveErrorNote(appendPhotoStorageNote(baseNote, photoMeta, "DRIVE_FAILED", ""), driveError),
+        overflow: false,
+        originalLength,
+        storedExternally: false,
+        driveUploadFailed: true,
+        driveUploadError: driveError,
+      };
     }
   }
   const normalized = normalizePhotoForSheet(photoValue);
@@ -447,6 +472,8 @@ async function materializePhotoStorage(photoValue, photoName = "", baseNote = ""
     overflow: normalized.overflow,
     originalLength: normalized.originalLength,
     storedExternally: false,
+    driveUploadFailed: false,
+    driveUploadError: "",
   };
 }
 
@@ -1504,7 +1531,12 @@ async function validateBeforeAfterClose(visitaId) {
 
 async function registrarEvidencia(payload) {
   const result = await registrarEvidenciasBatch([payload]);
-  return { photoOverflow: result.photoOverflow, originalPhotoLength: result.maxOriginalPhotoLength || 0 };
+  return {
+    photoOverflow: result.photoOverflow,
+    originalPhotoLength: result.maxOriginalPhotoLength || 0,
+    driveUploadFailed: result.driveUploadFailed,
+    driveUploadError: result.driveUploadError || "",
+  };
 }
 
 async function registrarEvidenciasBatch(payloads = []) {
@@ -1515,12 +1547,16 @@ async function registrarEvidenciasBatch(payloads = []) {
   const rows = [];
   let photoOverflow = false;
   let maxOriginalPhotoLength = 0;
+  let driveUploadFailed = false;
+  let driveUploadError = "";
 
   for (const payload of payloads) {
     const photoInfo = await materializePhotoStorage(payload.url_foto, payload.foto_nombre || "evidencia.jpg", payload.note || "");
     const safeNote = photoInfo.note;
     photoOverflow = photoOverflow || photoInfo.overflow;
     maxOriginalPhotoLength = Math.max(maxOriginalPhotoLength, photoInfo.originalLength || 0);
+    driveUploadFailed = driveUploadFailed || !!photoInfo.driveUploadFailed;
+    if (!driveUploadError && photoInfo.driveUploadError) driveUploadError = photoInfo.driveUploadError;
     const rowPayload = {
       evidencia_id: fitCell(payload.evidencia_id),
       external_id: fitCell(payload.external_id || ""),
@@ -1559,7 +1595,7 @@ async function registrarEvidenciasBatch(payloads = []) {
   }
 
   await appendSheetValues(`EVIDENCIAS!A2:${headerRangeEnd(header.length)}`, rows);
-  return { photoOverflow, maxOriginalPhotoLength };
+  return { photoOverflow, maxOriginalPhotoLength, driveUploadFailed, driveUploadError };
 }
 
 async function updateEvidenceRow(header, evidence, patch = {}) {
@@ -1570,7 +1606,13 @@ async function updateEvidenceRow(header, evidence, patch = {}) {
   next.note = photoInfo.note;
   const row = buildEvidenceRowFromHeader(header, next);
   await updateSheetValues(`EVIDENCIAS!A${evidence.rowIndex}:${headerRangeEnd(header.length)}${evidence.rowIndex}`, [row]);
-  return { photoOverflow: photoInfo.overflow, originalPhotoLength: photoInfo.originalLength, storedExternally: photoInfo.storedExternally };
+  return {
+    photoOverflow: photoInfo.overflow,
+    originalPhotoLength: photoInfo.originalLength,
+    storedExternally: photoInfo.storedExternally,
+    driveUploadFailed: photoInfo.driveUploadFailed,
+    driveUploadError: photoInfo.driveUploadError || "",
+  };
 }
 
 async function getMarcasActivas() {
@@ -3166,8 +3208,42 @@ app.post("/miniapp/cliente/deliverables", async (req, res) => {
   }
 });
 
+app.get("/ops/drive/test", async (req, res) => {
+  try {
+    if (OPS_TOKEN && req.headers["x-ops-token"] !== OPS_TOKEN && req.query?.token !== OPS_TOKEN) {
+      return res.status(403).json({ ok: false, error: "OPS_TOKEN requerido" });
+    }
+    const drive = await getDriveClient();
+    const content = `Promobolsillo Drive test ${nowISO()}`;
+    const requestBody = { name: `promobolsillo-drive-test-${Date.now()}.txt` };
+    if (EVIDENCE_DRIVE_FOLDER_ID) requestBody.parents = [EVIDENCE_DRIVE_FOLDER_ID];
+    const createRes = await drive.files.create({
+      requestBody,
+      media: { mimeType: "text/plain", body: Readable.from(Buffer.from(content, "utf8")) },
+      fields: "id, name",
+      supportsAllDrives: true,
+    });
+    return res.json({
+      ok: true,
+      folder_configured: !!EVIDENCE_DRIVE_FOLDER_ID,
+      file_id: createRes.data?.id || "",
+      name: createRes.data?.name || "",
+    });
+  } catch (error) {
+    const driveError = sanitizeDriveError(error);
+    console.error("/ops/drive/test error", driveError);
+    return res.status(500).json({ ok: false, error: driveError, folder_configured: !!EVIDENCE_DRIVE_FOLDER_ID });
+  }
+});
+
 app.get("/health", async (_req, res) => {
-  res.json({ ok: true, service: "promobolsillo-telegram", now: nowISO() });
+  res.json({
+    ok: true,
+    service: "promobolsillo-telegram",
+    version: PROMOBOLSILLO_DEPLOY_VERSION,
+    now: nowISO(),
+    drive_evidence_folder_configured: !!EVIDENCE_DRIVE_FOLDER_ID,
+  });
 });
 
 app.get("/", async (_req, res) => {
@@ -3529,7 +3605,8 @@ app.post("/miniapp/promotor/start-entry", async (req, res) => {
       tienda_nombre: geofence.tienda?.nombre_tienda || tiendaId,
       tienda_display: getStoreDisplayNameById(tiendaId, tiendaMap),
       started_at: nowISO(),
-      warning: attendanceResult.photoOverflow ? "attendance_photo_too_large_for_sheets" : undefined,
+      warning: attendanceResult.driveUploadFailed ? "drive_upload_failed" : (attendanceResult.photoOverflow ? "attendance_photo_too_large_for_sheets" : undefined),
+      drive_error: attendanceResult.driveUploadFailed ? attendanceResult.driveUploadError : undefined,
       plan_status: planRow ? (isVisitValidForPlan({ resultado_geocerca_entrada: geofence.resultado }) ? "VISITADA" : "PLANEADA") : "SIN_PLANEACION",
     });
   } catch (error) {
@@ -3688,7 +3765,8 @@ app.post("/miniapp/promotor/evidence-register", async (req, res) => {
       visita_id: visitaId,
       created,
       count: created.length,
-      warning: batchResult.photoOverflow ? "evidence_photo_too_large_for_sheets" : undefined,
+      warning: batchResult.driveUploadFailed ? "drive_upload_failed" : (batchResult.photoOverflow ? "evidence_photo_too_large_for_sheets" : undefined),
+      drive_error: batchResult.driveUploadFailed ? batchResult.driveUploadError : undefined,
       analysis_status: "scheduled",
       postprocess_warning: warnings[0] || undefined,
     });
@@ -3784,7 +3862,7 @@ app.post("/miniapp/promotor/replace-evidence", async (req, res) => {
       });
       await recalculateTareasForVisita(found.evidence.visita_id);
     }
-    return res.json({ ok: true, evidencia_id: evidenciaId, replaced: true, warning: result.photoOverflow ? "evidence_photo_too_large_for_sheets" : undefined });
+    return res.json({ ok: true, evidencia_id: evidenciaId, replaced: true, warning: result.driveUploadFailed ? "drive_upload_failed" : (result.photoOverflow ? "evidence_photo_too_large_for_sheets" : undefined), drive_error: result.driveUploadFailed ? result.driveUploadError : undefined });
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message || "No se pudo reemplazar la evidencia." });
   }
