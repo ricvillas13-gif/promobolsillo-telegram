@@ -26,7 +26,7 @@ app.use(bodyParser.urlencoded({ extended: false, limit: "35mb" }));
 
 const TELEGRAM_API = TELEGRAM_BOT_TOKEN ? `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}` : "";
 const EVPLUS_VERSION = "EVPLUS_V1";
-const PROMOBOLSILLO_DEPLOY_VERSION = "E013_SUPERVISOR_REVIEW_QUEUE";
+const PROMOBOLSILLO_DEPLOY_VERSION = "E014_REZGO_RULES_IMAGE_VIEWER_EXIT";
 const EVPLUS_MIN_DIMENSION = 420;
 const EVPLUS_MIN_ESTIMATED_BYTES = 9000;
 const PHOTO_CELL_LIMIT = 48000;
@@ -506,6 +506,21 @@ function canonicalEvidenceTypeLabel(value) {
 
 function evidenceTypeKey(value) {
   return normalizeTextKey(canonicalEvidenceTypeLabel(value));
+}
+
+function isFlexibleSelectableEvidenceRule(value) {
+  const key = evidenceTypeKey(value);
+  return key === "EVIDENCIA DE MARCA TIPO SELECCIONABLE" ||
+    key === "EVIDENCIA DE MARCA" ||
+    key.includes("TIPO SELECCIONABLE");
+}
+
+function normalizeEvidencePhase(value, fallback = "ESTADO_ACTUAL") {
+  const key = normalizeTextKey(value);
+  if (!key || key === "NA" || key === "N/A" || key === "ESTADO ACTUAL" || key === "ESTADO_ACTUAL" || key === "ACTUAL") return fallback;
+  if (key === "ANTES") return "ANTES";
+  if (key === "DESPUES" || key === "DESPUÉS") return "DESPUES";
+  return norm(value) || fallback;
 }
 
 function buildEvidenceGroupKey(visitaId, marcaId, tipoEvidencia, fase) {
@@ -1697,8 +1712,26 @@ async function getReglasPorMarca(marcaId) {
       })
       .filter((rule) => !!rule.tipo_evidencia);
 
+    const hasFlexible = rules.some((rule) => isFlexibleSelectableEvidenceRule(rule.tipo_evidencia));
+    const effectiveRules = hasFlexible && catalog.length
+      ? catalog.map((item, idx) => ({
+          marca_id: marcaId,
+          tipo_evidencia: item.tipo_evidencia,
+          fotos_requeridas: safeInt(item.fotos_requeridas, 1),
+          requiere_antes_despues: false,
+          activa: true,
+          orden: idx + 1,
+          obligatoria: false,
+          observaciones: "Tipo seleccionable por el promotor para Estado actual",
+          descripcion_corta: item.descripcion_corta || "",
+          origen: "TIPOS_EVIDENCIA_FLEXIBLE",
+          required_task: false,
+          fase_default: "ESTADO_ACTUAL",
+        }))
+      : rules;
+
     const seen = new Set();
-    return rules
+    return effectiveRules
       .sort((a, b) => safeInt(a.orden, 9999) - safeInt(b.orden, 9999) || String(a.tipo_evidencia).localeCompare(String(b.tipo_evidencia)))
       .filter((rule) => {
         const key = evidenceTypeKey(rule.tipo_evidencia);
@@ -1707,7 +1740,20 @@ async function getReglasPorMarca(marcaId) {
         return true;
       });
   } catch {
-    return [];
+    return catalog.map((item, idx) => ({
+      marca_id: marcaId,
+      tipo_evidencia: item.tipo_evidencia,
+      fotos_requeridas: safeInt(item.fotos_requeridas, 1),
+      requiere_antes_despues: false,
+      activa: true,
+      orden: idx + 1,
+      obligatoria: false,
+      observaciones: "Tipo seleccionable por el promotor para Estado actual",
+      descripcion_corta: item.descripcion_corta || "",
+      origen: "TIPOS_EVIDENCIA_FALLBACK",
+      required_task: false,
+      fase_default: "ESTADO_ACTUAL",
+    }));
   }
 }
 
@@ -2033,6 +2079,7 @@ async function createTareasForVisita({ visitaId, planId, fecha, promotorId, tien
   for (const tm of tiendaMarcas) {
     const reglas = await getReglasPorMarca(tm.marca_id);
     for (const regla of reglas) {
+      if (regla.required_task === false || isFlexibleSelectableEvidenceRule(regla.tipo_evidencia)) continue;
       const payload = {
         tarea_id: `TV-${Date.now()}-${tm.marca_id}-${evidenceTypeKey(regla.tipo_evidencia).replace(/[^A-Z0-9]+/g, "").slice(0, 24)}`,
         visita_id: visitaId,
@@ -3247,6 +3294,8 @@ app.get("/health", async (_req, res) => {
     now: nowISO(),
     drive_evidence_folder_configured: !!EVIDENCE_DRIVE_FOLDER_ID,
     demo_inline_fallback_enabled: true,
+    rezgo_e014_flexible_evidence_types: true,
+    image_viewer_escape_enabled: true,
   });
 });
 
@@ -3662,7 +3711,7 @@ app.post("/miniapp/promotor/evidence-register", async (req, res) => {
     const marcaIdRaw = norm(req.body?.marca_id);
     const marcaNombreRaw = norm(req.body?.marca_nombre);
     const tipoEvidencia = canonicalEvidenceTypeLabel(req.body?.tipo_evidencia);
-    const fase = norm(req.body?.fase || "NA") || "NA";
+    const fase = normalizeEvidencePhase(req.body?.fase, "ESTADO_ACTUAL");
     const descripcion = norm(req.body?.descripcion);
     const source = upper(req.body?.source || "CAMARA");
     const fotos = Array.isArray(req.body?.fotos) ? req.body.fotos : [];
