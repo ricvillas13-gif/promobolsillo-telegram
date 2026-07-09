@@ -26,7 +26,7 @@ app.use(bodyParser.urlencoded({ extended: false, limit: "35mb" }));
 
 const TELEGRAM_API = TELEGRAM_BOT_TOKEN ? `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}` : "";
 const EVPLUS_VERSION = "EVPLUS_V1";
-const PROMOBOLSILLO_DEPLOY_VERSION = "E014_REZGO_RULES_IMAGE_VIEWER_EXIT";
+const PROMOBOLSILLO_DEPLOY_VERSION = "E014B_CANCEL_EVIDENCE_REFRESH";
 const EVPLUS_MIN_DIMENSION = 420;
 const EVPLUS_MIN_ESTIMATED_BYTES = 9000;
 const PHOTO_CELL_LIMIT = 48000;
@@ -3296,6 +3296,7 @@ app.get("/health", async (_req, res) => {
     demo_inline_fallback_enabled: true,
     rezgo_e014_flexible_evidence_types: true,
     image_viewer_escape_enabled: true,
+    cancel_evidence_refresh_enabled: true,
   });
 });
 
@@ -3843,9 +3844,8 @@ app.post("/miniapp/promotor/cancel-evidence", async (req, res) => {
       status: "ANULADA",
       note: note ? `${found.evidence.note ? `${found.evidence.note} | ` : ""}${note}` : found.evidence.note,
     });
-    if (galleryAuthorization?.row) {
-      await consumeGalleryAuthorization(galleryAuthorization.row, 1);
-    }
+    // E014B: cancelar/anular evidencia no consume autorización de galería.
+    // Se elimina referencia a galleryAuthorization porque no existe en este endpoint.
     if (upper(found.evidence.tipo_evidencia) !== "ASISTENCIA") {
       scheduleEvidenceGroupAnalysis({
         visitaId: found.evidence.visita_id,
