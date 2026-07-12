@@ -26,7 +26,7 @@ app.use(bodyParser.urlencoded({ extended: false, limit: "35mb" }));
 
 const TELEGRAM_API = TELEGRAM_BOT_TOKEN ? `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}` : "";
 const EVPLUS_VERSION = "EVPLUS_V1";
-const PROMOBOLSILLO_DEPLOY_VERSION = "E016_SUPERVISOR_FILTROS_COMENTAR_REDESIGN";
+const PROMOBOLSILLO_DEPLOY_VERSION = "E018_PROMOTOR_SUPERVISOR_NAVEGACION_DETALLE_UTIL";
 const EVPLUS_MIN_DIMENSION = 420;
 const EVPLUS_MIN_ESTIMATED_BYTES = 9000;
 const PHOTO_CELL_LIMIT = 48000;
@@ -3416,7 +3416,6 @@ app.get("/health", async (_req, res) => {
     image_viewer_escape_enabled: true,
     cancel_evidence_refresh_enabled: true,
     e015_marca_fuera_servicio_enabled: true,
-    e016_supervisor_filters_comentar_redesign_enabled: true,
   });
 });
 
@@ -4267,6 +4266,56 @@ app.post("/miniapp/supervisor/alert-close", async (req, res) => {
     return res.json({ ok: true, alerta_id: alertaId, status, resolved_classification });
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message || "alert close error" });
+  }
+});
+
+
+
+app.post("/miniapp/supervisor/out-of-service", async (req, res) => {
+  try {
+    const { actor } = await getActorFromRequest(req);
+    if (actor.role !== "supervisor") return res.status(403).json({ ok: false, error: "Solo supervisor" });
+    const team = await getPromotoresDeSupervisor(actor.profile.external_id);
+    const promotorIds = new Set(team.map((item) => item.promotor_id));
+    const promotorFilter = norm(req.body?.promotor_id);
+    const marcaMap = await getMarcaMap();
+    const visitMap = await getAllVisitsMap();
+    const tiendaMap = await getTiendaMap();
+    const promotorMap = await getPromotorMap();
+    const { rows } = await getMarcasFueraServicioRowsAll();
+    let visible = rows.filter((item) => upper(item.estatus || "ACTIVA") === "ACTIVA" && promotorIds.has(item.promotor_id));
+    if (promotorFilter) visible = visible.filter((item) => item.promotor_id === promotorFilter);
+    visible.sort((a, b) => String(b.fecha_hora).localeCompare(String(a.fecha_hora)));
+    const output = visible.map((item) => {
+      const visit = visitMap[item.visita_id] || {};
+      const tiendaId = item.tienda_id || visit.tienda_id || "";
+      const tienda = tiendaMap[tiendaId] || {};
+      const marca = marcaMap[item.marca_id] || {};
+      const promotor = promotorMap[item.promotor_id] || {};
+      return {
+        registro_id: item.registro_id,
+        fecha_hora: item.fecha_hora,
+        fecha_hora_fmt: fmtDateTimeTZ(item.fecha_hora),
+        visita_id: item.visita_id,
+        promotor_id: item.promotor_id,
+        promotor_nombre: promotor.nombre || item.promotor_id,
+        external_id: item.external_id,
+        tienda_id: tiendaId,
+        tienda_nombre: tienda.nombre_tienda || tienda.nombre || tiendaId,
+        tienda_display: getStoreDisplayNameById(tiendaId, tiendaMap),
+        marca_id: item.marca_id,
+        marca_nombre: marca.marca_nombre || marca.nombre_marca || marca.nombre || item.marca_id,
+        motivo: item.motivo,
+        comentario: item.comentario,
+        lat: item.lat,
+        lon: item.lon,
+        accuracy: item.accuracy,
+        estatus: item.estatus || "ACTIVA",
+      };
+    });
+    return res.json({ ok: true, rows: output });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message || "supervisor out of service error" });
   }
 });
 
