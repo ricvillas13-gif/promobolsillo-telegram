@@ -26,7 +26,7 @@ app.use(bodyParser.urlencoded({ extended: false, limit: "35mb" }));
 
 const TELEGRAM_API = TELEGRAM_BOT_TOKEN ? `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}` : "";
 const EVPLUS_VERSION = "EVPLUS_V1";
-const PROMOBOLSILLO_DEPLOY_VERSION = "E015_PROMOTOR_MARCA_FUERA_SERVICIO";
+const PROMOBOLSILLO_DEPLOY_VERSION = "E016_SUPERVISOR_FILTROS_COMENTAR_REDESIGN";
 const EVPLUS_MIN_DIMENSION = 420;
 const EVPLUS_MIN_ESTIMATED_BYTES = 9000;
 const PHOTO_CELL_LIMIT = 48000;
@@ -3416,6 +3416,7 @@ app.get("/health", async (_req, res) => {
     image_viewer_escape_enabled: true,
     cancel_evidence_refresh_enabled: true,
     e015_marca_fuera_servicio_enabled: true,
+    e016_supervisor_filters_comentar_redesign_enabled: true,
   });
 });
 
