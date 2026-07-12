@@ -1,3 +1,4 @@
+// E019_BACKEND_PROMOTOR_OUT_OF_SERVICE_TODAY: endpoint promotor para consultar marcas sin servicio del dia y conservar soporte supervisor.
 // E018B_BACKEND_SUPERVISOR_SIN_SERVICIO_CONFIRMADO: marcador visible para verificar en GitHub; conserva MARCAS_FUERA_SERVICIO.
 import express from "express";
 import bodyParser from "body-parser";
@@ -27,7 +28,7 @@ app.use(bodyParser.urlencoded({ extended: false, limit: "35mb" }));
 
 const TELEGRAM_API = TELEGRAM_BOT_TOKEN ? `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}` : "";
 const EVPLUS_VERSION = "EVPLUS_V1";
-const PROMOBOLSILLO_DEPLOY_VERSION = "E018_PROMOTOR_SUPERVISOR_NAVEGACION_DETALLE_UTIL";
+const PROMOBOLSILLO_DEPLOY_VERSION = "E019_PROMOTOR_SUPERVISOR_FLUIDEZ_REVISION_Y_SIN_SERVICIO";
 const EVPLUS_MIN_DIMENSION = 420;
 const EVPLUS_MIN_ESTIMATED_BYTES = 9000;
 const PHOTO_CELL_LIMIT = 48000;
@@ -3613,6 +3614,57 @@ app.post("/miniapp/promotor/evidences-today", async (req, res) => {
     return res.json({ ok: true, evidencias });
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message || "evidences today error" });
+  }
+});
+
+app.post("/miniapp/promotor/out-of-service-today", async (req, res) => {
+  try {
+    const { actor } = await getActorFromRequest(req);
+    if (actor.role !== "promotor") return res.status(403).json({ ok: false, error: "Solo promotor" });
+    const today = todayISO();
+    const marcaMap = await getMarcaMap();
+    const visitMap = await getAllVisitsMap();
+    const tiendaMap = await getTiendaMap();
+    const { rows } = await getMarcasFueraServicioRowsAll();
+    const visible = rows
+      .filter((item) => upper(item.estatus || "ACTIVA") === "ACTIVA")
+      .filter((item) => item.promotor_id === actor.profile.promotor_id || item.external_id === actor.profile.external_id)
+      .filter((item) => {
+        if (!item.fecha_hora) return true;
+        const d = new Date(item.fecha_hora);
+        if (Number.isNaN(d.getTime())) return true;
+        return ymdInTZ(d, APP_TZ) === today;
+      })
+      .sort((a, b) => String(b.fecha_hora).localeCompare(String(a.fecha_hora)))
+      .map((item) => {
+        const visit = visitMap[item.visita_id] || {};
+        const tiendaId = item.tienda_id || visit.tienda_id || "";
+        const tienda = tiendaMap[tiendaId] || {};
+        const marca = marcaMap[item.marca_id] || {};
+        return {
+          registro_id: item.registro_id,
+          fecha_hora: item.fecha_hora,
+          fecha_hora_fmt: fmtDateTimeTZ(item.fecha_hora),
+          visita_id: item.visita_id,
+          promotor_id: item.promotor_id,
+          promotor_nombre: actor.profile.nombre || actor.profile.promotor_id,
+          external_id: item.external_id,
+          tienda_id: tiendaId,
+          tienda_nombre: tienda.nombre_tienda || tienda.nombre || tiendaId,
+          tienda_display: getStoreDisplayNameById(tiendaId, tiendaMap),
+          marca_id: item.marca_id,
+          marca_nombre: marca.marca_nombre || marca.nombre_marca || marca.nombre || item.marca_id,
+          motivo: item.motivo,
+          comentario: item.comentario,
+          lat: item.lat,
+          lon: item.lon,
+          accuracy: item.accuracy,
+          estatus: item.estatus || "ACTIVA",
+        };
+      });
+    return res.json({ ok: true, rows: visible });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message || "promotor out of service error" });
   }
 });
 
