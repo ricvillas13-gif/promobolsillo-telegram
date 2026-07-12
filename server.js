@@ -1,3 +1,4 @@
+// E018B_BACKEND_SUPERVISOR_SIN_SERVICIO_CONFIRMADO: marcador visible para verificar en GitHub; conserva MARCAS_FUERA_SERVICIO.
 import express from "express";
 import bodyParser from "body-parser";
 import crypto from "crypto";
