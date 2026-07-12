@@ -26,10 +26,26 @@ app.use(bodyParser.urlencoded({ extended: false, limit: "35mb" }));
 
 const TELEGRAM_API = TELEGRAM_BOT_TOKEN ? `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}` : "";
 const EVPLUS_VERSION = "EVPLUS_V1";
-const PROMOBOLSILLO_DEPLOY_VERSION = "E014B_CANCEL_EVIDENCE_REFRESH";
+const PROMOBOLSILLO_DEPLOY_VERSION = "E015_PROMOTOR_MARCA_FUERA_SERVICIO";
 const EVPLUS_MIN_DIMENSION = 420;
 const EVPLUS_MIN_ESTIMATED_BYTES = 9000;
 const PHOTO_CELL_LIMIT = 48000;
+const MARCAS_FUERA_SERVICIO_SHEET = "MARCAS_FUERA_SERVICIO";
+const MARCAS_FUERA_SERVICIO_HEADER = [
+  "registro_id",
+  "fecha_hora",
+  "visita_id",
+  "promotor_id",
+  "external_id",
+  "tienda_id",
+  "marca_id",
+  "motivo",
+  "comentario",
+  "lat",
+  "lon",
+  "accuracy",
+  "estatus",
+];
 const EVIDENCE_DRIVE_FOLDER_ID = GOOGLE_DRIVE_EVIDENCE_FOLDER_ID || DRIVE_EVIDENCE_FOLDER_ID || "";
 const pendingEvidenceAnalysisTimers = new Map();
 const pendingVisitTaskRecalcTimers = new Map();
@@ -746,6 +762,22 @@ async function getSheetHeader(sheetName) {
     throw new Error(`No se pudo leer la hoja ${sheetName}. Verifica que exista y que el nombre sea exacto.`);
   }
 }
+async function ensureSheetWithHeader(sheetName, header = []) {
+  const sheets = await getSheetsClient();
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: SHEET_ID, fields: "sheets.properties.title" });
+  const exists = (meta.data.sheets || []).some((item) => item?.properties?.title === sheetName);
+  if (!exists) {
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: SHEET_ID,
+      requestBody: { requests: [{ addSheet: { properties: { title: sheetName } } }] },
+    });
+  }
+  if (header.length) {
+    await updateSheetValues(`${sheetName}!A1:${headerRangeEnd(header.length)}1`, [header]);
+  }
+  invalidateSheetCache(sheetName);
+}
+
 
 async function getPolicyValidation() {
   try {
@@ -2006,6 +2038,88 @@ async function getTiendaMarcasActivasByTiendaId(tiendaId) {
     .map((row) => ({ tienda_id: norm(row[0]), marca_id: norm(row[1]), activa: true, observaciones: norm(row[3]) }));
 }
 
+async function ensureMarcasFueraServicioSheet() {
+  await ensureSheetWithHeader(MARCAS_FUERA_SERVICIO_SHEET, MARCAS_FUERA_SERVICIO_HEADER);
+}
+
+function parseMarcaFueraServicioRow(row, idx, header) {
+  const map = headerIndexMap(header);
+  return {
+    rowIndex: idx + 2,
+    registro_id: norm(row[map.registro_id]),
+    fecha_hora: norm(row[map.fecha_hora]),
+    visita_id: norm(row[map.visita_id]),
+    promotor_id: norm(row[map.promotor_id]),
+    external_id: norm(row[map.external_id]),
+    tienda_id: norm(row[map.tienda_id]),
+    marca_id: norm(row[map.marca_id]),
+    motivo: norm(row[map.motivo]),
+    comentario: norm(row[map.comentario]),
+    lat: norm(row[map.lat]),
+    lon: norm(row[map.lon]),
+    accuracy: norm(row[map.accuracy]),
+    estatus: upper(row[map.estatus] || "ACTIVA"),
+  };
+}
+
+function buildMarcaFueraServicioRowFromHeader(header, payload) {
+  const row = new Array(header.length).fill("");
+  header.forEach((name, idx) => {
+    const key = norm(name);
+    row[idx] = payload[key] != null ? payload[key] : "";
+  });
+  return row;
+}
+
+async function getMarcasFueraServicioRowsAll() {
+  await ensureMarcasFueraServicioSheet();
+  const header = await getSheetHeader(MARCAS_FUERA_SERVICIO_SHEET);
+  const rows = await getSheetValues(`${MARCAS_FUERA_SERVICIO_SHEET}!A2:${headerRangeEnd(header.length)}`);
+  return { header, rows: rows.map((row, idx) => parseMarcaFueraServicioRow(row, idx, header)) };
+}
+
+async function getMarcasFueraServicioByVisitId(visitaId) {
+  const { rows } = await getMarcasFueraServicioRowsAll();
+  return rows.filter((item) => item.visita_id === visitaId && upper(item.estatus || "ACTIVA") === "ACTIVA");
+}
+
+async function updateMarcaFueraServicioRow(header, currentRow, patch = {}) {
+  const row = buildMarcaFueraServicioRowFromHeader(header, { ...currentRow, ...patch });
+  await updateSheetValues(`${MARCAS_FUERA_SERVICIO_SHEET}!A${currentRow.rowIndex}:${headerRangeEnd(header.length)}${currentRow.rowIndex}`, [row]);
+}
+
+async function upsertMarcaFueraServicio(payload = {}) {
+  const pack = await getMarcasFueraServicioRowsAll();
+  const now = nowISO();
+  const existing = pack.rows.find((row) =>
+    row.visita_id === payload.visita_id &&
+    row.promotor_id === payload.promotor_id &&
+    row.marca_id === payload.marca_id &&
+    upper(row.estatus || "ACTIVA") === "ACTIVA"
+  );
+  const rowPayload = {
+    registro_id: existing?.registro_id || `MFS-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    fecha_hora: now,
+    visita_id: payload.visita_id || "",
+    promotor_id: payload.promotor_id || "",
+    external_id: payload.external_id || "",
+    tienda_id: payload.tienda_id || "",
+    marca_id: payload.marca_id || "",
+    motivo: payload.motivo || "",
+    comentario: payload.comentario || "",
+    lat: payload.lat || "",
+    lon: payload.lon || "",
+    accuracy: payload.accuracy || "",
+    estatus: payload.estatus || "ACTIVA",
+  };
+  if (existing) {
+    await updateMarcaFueraServicioRow(pack.header, existing, rowPayload);
+    return { ...rowPayload, updated: true };
+  }
+  await appendSheetValues(`${MARCAS_FUERA_SERVICIO_SHEET}!A2:${headerRangeEnd(pack.header.length)}`, [buildMarcaFueraServicioRowFromHeader(pack.header, rowPayload)]);
+  return { ...rowPayload, updated: false };
+}
+
 async function getTareasVisitaHeader() {
   return getSheetHeader("TAREAS_VISITA");
 }
@@ -2135,10 +2249,14 @@ async function recalculateTareasForVisita(visitaId) {
   const tareas = tareasPack.rows.filter((item) => item.visita_id === visitaId);
   if (!tareas.length) return [];
   const evidences = await getEvidenciasByVisitId(visitaId);
+  const marcasFueraServicio = await getMarcasFueraServicioByVisitId(visitaId);
+  const marcasFueraServicioSet = new Set(marcasFueraServicio.map((item) => upper(item.marca_id)).filter(Boolean));
   const updated = [];
   for (const task of tareas) {
     const counters = countAntesDespuesForTask(evidences, task);
-    const resolved = resolveTaskStatus(task, counters);
+    const resolved = marcasFueraServicioSet.has(upper(task.marca_id))
+      ? { estatus: "FUERA_SERVICIO", total_fotos_cargadas: counters.total }
+      : resolveTaskStatus(task, counters);
     await updateTareaVisitaRow(tareasPack.header, task, { ...resolved, updated_at: nowISO() });
     updated.push({ ...task, ...resolved });
   }
@@ -3297,6 +3415,7 @@ app.get("/health", async (_req, res) => {
     rezgo_e014_flexible_evidence_types: true,
     image_viewer_escape_enabled: true,
     cancel_evidence_refresh_enabled: true,
+    e015_marca_fuera_servicio_enabled: true,
   });
 });
 
@@ -3521,6 +3640,7 @@ app.post("/miniapp/promotor/evidence-context", async (req, res) => {
       marca_id: item.marca_id,
       marca_nombre: marcaMap[item.marca_id]?.marca_nombre || item.marca_id,
     })).sort((a, b) => String(a.marca_nombre).localeCompare(String(b.marca_nombre)));
+    const marcasFueraServicio = await getMarcasFueraServicioByVisitId(visitaId);
     return res.json({
       ok: true,
       visita: {
@@ -3530,6 +3650,16 @@ app.post("/miniapp/promotor/evidence-context", async (req, res) => {
         tienda_display: getStoreDisplayNameById(visit.tienda_id, tiendaMap),
       },
       marcas,
+      marcas_fuera_servicio: marcasFueraServicio.map((item) => ({
+        registro_id: item.registro_id,
+        fecha_hora: item.fecha_hora,
+        visita_id: item.visita_id,
+        tienda_id: item.tienda_id,
+        marca_id: item.marca_id,
+        motivo: item.motivo,
+        comentario: item.comentario,
+        estatus: item.estatus,
+      })),
     });
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message || "evidence context error" });
@@ -3701,6 +3831,53 @@ app.post("/miniapp/promotor/close-visit", async (req, res) => {
   } catch (error) {
     console.error("close-visit error", error);
     return res.status(500).json({ ok: false, error: error.message || "No se pudo registrar la salida real." });
+  }
+});
+
+app.post("/miniapp/promotor/marca-fuera-servicio", async (req, res) => {
+  try {
+    const { actor } = await getActorFromRequest(req);
+    if (actor.role !== "promotor") return res.status(403).json({ ok: false, error: "Solo promotor" });
+    const visitaId = norm(req.body?.visita_id);
+    const marcaId = norm(req.body?.marca_id);
+    const motivo = norm(req.body?.motivo);
+    const comentario = norm(req.body?.comentario);
+    const lat = norm(req.body?.lat);
+    const lon = norm(req.body?.lon);
+    const accuracy = norm(req.body?.accuracy);
+    if (!visitaId) return res.status(400).json({ ok: false, error: "visita_id requerido" });
+    if (!marcaId) return res.status(400).json({ ok: false, error: "marca_id requerido" });
+    if (!motivo) return res.status(400).json({ ok: false, error: "Selecciona un motivo para marcar fuera de servicio." });
+    const visit = await getVisitById(visitaId);
+    if (!visit || visit.promotor_id !== actor.profile.promotor_id) return res.status(404).json({ ok: false, error: "Visita no encontrada" });
+    if (visit.hora_fin) return res.status(409).json({ ok: false, error: "La visita ya está cerrada; no se puede modificar." });
+    const marcasTienda = await getTiendaMarcasActivasByTiendaId(visit.tienda_id);
+    if (!marcasTienda.some((item) => item.marca_id === marcaId)) {
+      return res.status(400).json({ ok: false, error: "La marca no está activa para esta tienda." });
+    }
+    const row = await upsertMarcaFueraServicio({
+      visita_id: visitaId,
+      promotor_id: actor.profile.promotor_id,
+      external_id: actor.profile.external_id,
+      tienda_id: visit.tienda_id,
+      marca_id: marcaId,
+      motivo,
+      comentario,
+      lat,
+      lon,
+      accuracy,
+      estatus: "ACTIVA",
+    });
+    scheduleVisitTaskRecalculation(visitaId);
+    return res.json({
+      ok: true,
+      message: "Marca marcada fuera de servicio para esta visita",
+      row,
+    });
+  } catch (error) {
+    console.error("marca-fuera-servicio error", error);
+    const statusCode = error?.isQuotaExceeded ? 503 : 500;
+    return res.status(statusCode).json({ ok: false, error: error.message || "No se pudo marcar la marca fuera de servicio." });
   }
 });
 
