@@ -1,3 +1,4 @@
+// E023B_BACKEND_FIX_EXTERNAL_CAMERA_CONTEXT: corrige captureContext no definido al cargar marca/tipo en cámara externa.
 // E023_EXTERNAL_CAMERA_WORKSPACE_BACKEND: cámara externa con contexto de captura variable y múltiples fotos por sesión.
 // E022_EXTERNAL_CAMERA_PHASE1_PWA_BACKEND: token temporal para módulo externo de cámara y registro directo de evidencia.
 // E020_BACKEND_SIN_CAMBIOS_FUNCIONALES: se conserva backend E019; cambios E020 son de UX frontend.
@@ -4164,7 +4165,7 @@ app.post("/external-camera/context", async (req, res) => {
         marca_nombre: payload.marca_nombre || (payload.marca_id ? (marcaMap[payload.marca_id]?.marca_nombre || payload.marca_id) : (marcas[0]?.marca_nombre || "")),
         tipo_evidencia: payload.tipo_evidencia || tipos[0]?.tipo_evidencia || "",
         fase: payload.fase || "ESTADO_ACTUAL",
-        descripcion: norm(captureContext.descripcion) || payload.descripcion || "",
+        descripcion: payload.descripcion || "",
         expires_at: new Date(payload.exp).toISOString(),
         marcas,
         tipos: tipos.map((item) => ({ tipo_evidencia: item.tipo_evidencia, descripcion_corta: item.descripcion_corta || "" })),
