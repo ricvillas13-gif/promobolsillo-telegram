@@ -1,3 +1,4 @@
+// E024_EXTERNAL_CAMERA_UX_WORKSPACE_BACKEND: token extendido, anulación desde cámara externa y marca fuera de servicio desde workspace.
 // E023B_BACKEND_FIX_EXTERNAL_CAMERA_CONTEXT: corrige captureContext no definido al cargar marca/tipo en cámara externa.
 // E023_EXTERNAL_CAMERA_WORKSPACE_BACKEND: cámara externa con contexto de captura variable y múltiples fotos por sesión.
 // E022_EXTERNAL_CAMERA_PHASE1_PWA_BACKEND: token temporal para módulo externo de cámara y registro directo de evidencia.
@@ -37,7 +38,7 @@ const EVPLUS_MIN_DIMENSION = 420;
 const EVPLUS_MIN_ESTIMATED_BYTES = 9000;
 const PHOTO_CELL_LIMIT = 48000;
 const MARCAS_FUERA_SERVICIO_SHEET = "MARCAS_FUERA_SERVICIO";
-const EXTERNAL_CAMERA_TOKEN_TTL_MS = 10 * 60 * 1000;
+const EXTERNAL_CAMERA_TOKEN_TTL_MS = 45 * 60 * 1000;
 
 const MARCAS_FUERA_SERVICIO_HEADER = [
   "registro_id",
@@ -4213,7 +4214,7 @@ app.post("/external-camera/upload", async (req, res) => {
       marca_id: marcaId || "",
       producto_id: "",
       tipo_evidencia: tipoEvidencia,
-      descripcion: payload.descripcion || "",
+      descripcion: norm(captureContext.descripcion) || payload.descripcion || "",
       status: "RECIBIDA",
       note: `EXTERNAL_CAMERA_WORKSPACE | EXTERNAL_CAMERA_SESSION:${payload.token_id} | MARCA:${marcaId} | TIPO:${tipoEvidencia}`,
       fase: normalizeEvidencePhase(captureContext.fase || payload.fase, "ESTADO_ACTUAL"),
@@ -4246,6 +4247,77 @@ app.post("/external-camera/upload", async (req, res) => {
   } catch (error) {
     console.error("external-camera-upload error", error);
     return res.status(500).json({ ok: false, error: error.message || "No se pudo subir la evidencia desde cámara externa." });
+  }
+});
+
+
+
+app.post("/external-camera/cancel", async (req, res) => {
+  try {
+    const payload = verifyExternalCameraToken(req.body?.token);
+    const evidenciaId = norm(req.body?.evidencia_id);
+    const note = norm(req.body?.note || "ANULADA_POR_PROMOTOR_DESDE_CAMARA_EXTERNA");
+    if (!evidenciaId) return res.status(400).json({ ok: false, error: "evidencia_id requerido" });
+    const found = await getEvidenceById(evidenciaId);
+    if (!found) return res.status(404).json({ ok: false, error: "Evidencia no encontrada" });
+    if (found.evidence.external_id !== payload.external_id || found.evidence.visita_id !== payload.visita_id) {
+      return res.status(403).json({ ok: false, error: "No autorizada para esta sesión de cámara." });
+    }
+    await updateEvidenceRow(found.header, found.evidence, {
+      status: "ANULADA",
+      note: note ? `${found.evidence.note ? `${found.evidence.note} | ` : ""}${note}` : found.evidence.note,
+    });
+    if (upper(found.evidence.tipo_evidencia) !== "ASISTENCIA") {
+      scheduleEvidenceGroupAnalysis({
+        visitaId: found.evidence.visita_id,
+        marcaId: found.evidence.marca_id,
+        tipoEvidencia: found.evidence.tipo_evidencia,
+        fase: found.evidence.fase || "NA",
+      });
+      scheduleVisitTaskRecalculation(found.evidence.visita_id);
+    }
+    return res.json({ ok: true, evidencia_id: evidenciaId, status: "ANULADA" });
+  } catch (error) {
+    console.error("external-camera-cancel error", error);
+    return res.status(500).json({ ok: false, error: error.message || "No se pudo anular la evidencia desde cámara externa." });
+  }
+});
+
+app.post("/external-camera/out-of-service", async (req, res) => {
+  try {
+    const payload = verifyExternalCameraToken(req.body?.token);
+    const marcaId = norm(req.body?.marca_id);
+    const motivo = norm(req.body?.motivo);
+    const comentario = norm(req.body?.comentario);
+    if (!payload.visita_id) return res.status(400).json({ ok: false, error: "visita_id requerido" });
+    if (!marcaId) return res.status(400).json({ ok: false, error: "marca_id requerido" });
+    if (!motivo) return res.status(400).json({ ok: false, error: "Selecciona un motivo para marcar fuera de servicio." });
+    const visit = await getVisitById(payload.visita_id);
+    if (!visit || visit.promotor_id !== payload.promotor_id) return res.status(404).json({ ok: false, error: "Visita no encontrada" });
+    if (visit.hora_fin) return res.status(409).json({ ok: false, error: "La visita ya está cerrada; no se puede modificar." });
+    const marcasTienda = await getTiendaMarcasActivasByTiendaId(visit.tienda_id);
+    if (!marcasTienda.some((item) => item.marca_id === marcaId)) {
+      return res.status(400).json({ ok: false, error: "La marca no está activa para esta tienda." });
+    }
+    const row = await upsertMarcaFueraServicio({
+      visita_id: payload.visita_id,
+      promotor_id: payload.promotor_id,
+      external_id: payload.external_id,
+      tienda_id: visit.tienda_id,
+      marca_id: marcaId,
+      motivo,
+      comentario,
+      lat: "",
+      lon: "",
+      accuracy: "",
+      estatus: "ACTIVA",
+    });
+    scheduleVisitTaskRecalculation(payload.visita_id);
+    return res.json({ ok: true, message: "Marca marcada fuera de servicio para esta visita", row });
+  } catch (error) {
+    console.error("external-camera-out-of-service error", error);
+    const statusCode = error?.isQuotaExceeded ? 503 : 500;
+    return res.status(statusCode).json({ ok: false, error: error.message || "No se pudo marcar la marca fuera de servicio desde cámara externa." });
   }
 });
 
