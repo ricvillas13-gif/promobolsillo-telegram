@@ -1,3 +1,4 @@
+// E020_BACKEND_SIN_CAMBIOS_FUNCIONALES: se conserva backend E019; cambios E020 son de UX frontend.
 // E019_BACKEND_PROMOTOR_OUT_OF_SERVICE_TODAY: endpoint promotor para consultar marcas sin servicio del dia y conservar soporte supervisor.
 // E018B_BACKEND_SUPERVISOR_SIN_SERVICIO_CONFIRMADO: marcador visible para verificar en GitHub; conserva MARCAS_FUERA_SERVICIO.
 import express from "express";
