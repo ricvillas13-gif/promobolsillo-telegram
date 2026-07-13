@@ -1,3 +1,4 @@
+// E022_EXTERNAL_CAMERA_PHASE1_PWA_BACKEND: token temporal para módulo externo de cámara y registro directo de evidencia.
 // E020_BACKEND_SIN_CAMBIOS_FUNCIONALES: se conserva backend E019; cambios E020 son de UX frontend.
 // E019_BACKEND_PROMOTOR_OUT_OF_SERVICE_TODAY: endpoint promotor para consultar marcas sin servicio del dia y conservar soporte supervisor.
 // E018B_BACKEND_SUPERVISOR_SIN_SERVICIO_CONFIRMADO: marcador visible para verificar en GitHub; conserva MARCAS_FUERA_SERVICIO.
@@ -29,11 +30,13 @@ app.use(bodyParser.urlencoded({ extended: false, limit: "35mb" }));
 
 const TELEGRAM_API = TELEGRAM_BOT_TOKEN ? `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}` : "";
 const EVPLUS_VERSION = "EVPLUS_V1";
-const PROMOBOLSILLO_DEPLOY_VERSION = "E019_PROMOTOR_SUPERVISOR_FLUIDEZ_REVISION_Y_SIN_SERVICIO";
+const PROMOBOLSILLO_DEPLOY_VERSION = "E022_EXTERNAL_CAMERA_PHASE1_PWA";
 const EVPLUS_MIN_DIMENSION = 420;
 const EVPLUS_MIN_ESTIMATED_BYTES = 9000;
 const PHOTO_CELL_LIMIT = 48000;
 const MARCAS_FUERA_SERVICIO_SHEET = "MARCAS_FUERA_SERVICIO";
+const EXTERNAL_CAMERA_TOKEN_TTL_MS = 10 * 60 * 1000;
+
 const MARCAS_FUERA_SERVICIO_HEADER = [
   "registro_id",
   "fecha_hora",
@@ -197,6 +200,40 @@ function buildBaseUrl(req) {
   const proto = String(req.headers["x-forwarded-proto"] || "https");
   const host = String(req.headers["x-forwarded-host"] || req.headers.host || "");
   return `${proto}://${host}`.replace(/\/+$/, "");
+}
+
+function getExternalCameraSecret() {
+  const raw = norm(OPS_TOKEN) || norm(TELEGRAM_BOT_TOKEN) || norm(SHEET_ID) || "promobolsillo-external-camera-dev";
+  return crypto.createHash("sha256").update(raw).digest("hex");
+}
+
+function signExternalCameraPayload(payload = {}) {
+  const body = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+  const sig = crypto.createHmac("sha256", getExternalCameraSecret()).update(body).digest("base64url");
+  return `${body}.${sig}`;
+}
+
+function verifyExternalCameraToken(token = "") {
+  const [body, sig] = norm(token).split(".");
+  if (!body || !sig) throw new Error("Token de cámara inválido.");
+  const expected = crypto.createHmac("sha256", getExternalCameraSecret()).update(body).digest("base64url");
+  const a = Buffer.from(sig);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) throw new Error("Token de cámara inválido.");
+  let payload = null;
+  try {
+    payload = JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
+  } catch {
+    throw new Error("Token de cámara inválido.");
+  }
+  if (!payload?.exp || Date.now() > safeNum(payload.exp, 0)) throw new Error("La sesión de cámara expiró. Vuelve a abrir la cámara desde PromoBolsillo.");
+  return payload;
+}
+
+function buildExternalCameraUrl(token = "") {
+  const base = norm(MINIAPP_BASE_URL);
+  if (!base) throw new Error("MINIAPP_BASE_URL no configurado para cámara externa.");
+  return `${base.replace(/\/+$/, "")}/?external_camera=1&token=${encodeURIComponent(token)}`;
 }
 
 function headerRangeEnd(headerLength) {
@@ -3419,6 +3456,7 @@ app.get("/health", async (_req, res) => {
     image_viewer_escape_enabled: true,
     cancel_evidence_refresh_enabled: true,
     e015_marca_fuera_servicio_enabled: true,
+    e022_external_camera_phase1_enabled: true,
   });
 });
 
@@ -4059,6 +4097,139 @@ app.post("/miniapp/promotor/evidence-register", async (req, res) => {
     console.error("evidence-register error", error);
     const statusCode = error?.isQuotaExceeded ? 503 : 500;
     return res.status(statusCode).json({ ok: false, error: error.message || "No se pudo registrar la evidencia." });
+  }
+});
+
+
+app.post("/miniapp/promotor/external-camera-session", async (req, res) => {
+  try {
+    const { actor } = await getActorFromRequest(req);
+    if (actor.role !== "promotor") return res.status(403).json({ ok: false, error: "Solo promotor" });
+    const visitaId = norm(req.body?.visita_id);
+    const marcaIdRaw = norm(req.body?.marca_id);
+    const marcaNombreRaw = norm(req.body?.marca_nombre);
+    const tipoEvidencia = canonicalEvidenceTypeLabel(req.body?.tipo_evidencia);
+    const fase = normalizeEvidencePhase(req.body?.fase, "ESTADO_ACTUAL");
+    const descripcion = norm(req.body?.descripcion);
+    const visit = await getVisitById(visitaId);
+    if (!visit || visit.promotor_id !== actor.profile.promotor_id) return res.status(404).json({ ok: false, error: "Visita no encontrada" });
+    if (!tipoEvidencia) return res.status(400).json({ ok: false, error: "tipo_evidencia requerido" });
+    const marcaId = marcaIdRaw || (await resolveMarcaIdByName(marcaNombreRaw));
+    const marcaNombre = marcaNombreRaw || (marcaId ? ((await getMarcaMap())[marcaId]?.marca_nombre || marcaId) : "");
+    const tokenPayload = {
+      token_id: `XCAP-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      exp: Date.now() + EXTERNAL_CAMERA_TOKEN_TTL_MS,
+      created_at: nowISO(),
+      external_id: actor.profile.external_id,
+      promotor_id: actor.profile.promotor_id,
+      promotor_nombre: actor.profile.nombre || "",
+      visita_id: visitaId,
+      tienda_id: visit.tienda_id,
+      tienda_nombre: visit.tienda_nombre || "",
+      marca_id: marcaId,
+      marca_nombre: marcaNombre,
+      tipo_evidencia: tipoEvidencia,
+      fase,
+      descripcion,
+    };
+    const token = signExternalCameraPayload(tokenPayload);
+    return res.json({
+      ok: true,
+      capture_url: buildExternalCameraUrl(token),
+      expires_at: new Date(tokenPayload.exp).toISOString(),
+    });
+  } catch (error) {
+    console.error("external-camera-session error", error);
+    return res.status(500).json({ ok: false, error: error.message || "No se pudo iniciar la cámara externa." });
+  }
+});
+
+app.post("/external-camera/context", async (req, res) => {
+  try {
+    const payload = verifyExternalCameraToken(req.body?.token);
+    return res.json({
+      ok: true,
+      context: {
+        tienda_id: payload.tienda_id || "",
+        tienda_nombre: payload.tienda_nombre || "",
+        marca_id: payload.marca_id || "",
+        marca_nombre: payload.marca_nombre || "",
+        tipo_evidencia: payload.tipo_evidencia || "",
+        fase: payload.fase || "ESTADO_ACTUAL",
+        descripcion: payload.descripcion || "",
+        expires_at: new Date(payload.exp).toISOString(),
+      },
+    });
+  } catch (error) {
+    return res.status(401).json({ ok: false, error: error.message || "Sesión de cámara inválida." });
+  }
+});
+
+app.post("/external-camera/upload", async (req, res) => {
+  try {
+    const payload = verifyExternalCameraToken(req.body?.token);
+    const photo = req.body?.photo || req.body?.foto || {};
+    const photoName = fitCell(norm(photo?.name || `evidencia-externa-${Date.now()}.jpg`));
+    const photoValue = norm(photo?.dataUrl || photo?.url || "");
+    if (!photoValue) return res.status(400).json({ ok: false, error: "Foto requerida" });
+    const visit = await getVisitById(payload.visita_id);
+    if (!visit || visit.promotor_id !== payload.promotor_id) return res.status(404).json({ ok: false, error: "Visita no encontrada para esta cámara." });
+    const evidenciasActuales = await getEvidenciasByVisitId(payload.visita_id);
+    const existing = evidenciasActuales.find((item) => norm(item.note).includes(`EXTERNAL_CAMERA_TOKEN:${payload.token_id}`));
+    if (existing?.evidencia_id) {
+      return res.json({ ok: true, evidencia_id: existing.evidencia_id, message: "Esta foto ya había sido registrada." });
+    }
+    const evidenceId = `EV-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const rowPayload = {
+      evidencia_id: evidenceId,
+      external_id: payload.external_id,
+      fecha_hora: nowISO(),
+      tipo_evento: "EVIDENCIA_OPERATIVA",
+      origen: "OPERACION_CAMARA_EXTERNA",
+      jornada_id: "",
+      visita_id: payload.visita_id,
+      url_foto: photoValue,
+      lat: "",
+      lon: "",
+      resultado_ai: "Pendiente",
+      score_confianza: "0.90",
+      riesgo: "BAJO",
+      marca_id: payload.marca_id || "",
+      producto_id: "",
+      tipo_evidencia: canonicalEvidenceTypeLabel(payload.tipo_evidencia),
+      descripcion: payload.descripcion || "",
+      status: "RECIBIDA",
+      note: `EXTERNAL_CAMERA_PHASE1 | EXTERNAL_CAMERA_TOKEN:${payload.token_id}`,
+      fase: normalizeEvidencePhase(payload.fase, "ESTADO_ACTUAL"),
+      foto_nombre: photoName,
+      accuracy: "",
+      requiere_revision_supervisor: "FALSE",
+      revisado_por: "",
+      fecha_revision: "",
+      decision_supervisor: "",
+      motivo_revision: "",
+      hallazgos_ai: "",
+      reglas_disparadas: "",
+      analizado_at: "",
+      version_motor_ai: "",
+      hash_foto: buildEvidencePhotoHash(photoValue, photoName),
+    };
+    const batchResult = await registrarEvidenciasBatch([rowPayload]);
+    try {
+      scheduleEvidenceGroupAnalysis({ visitaId: payload.visita_id, marcaId: payload.marca_id || "", tipoEvidencia: payload.tipo_evidencia, fase: payload.fase || "ESTADO_ACTUAL" });
+      scheduleVisitTaskRecalculation(payload.visita_id);
+    } catch (postprocessError) {
+      console.warn("external-camera upload postprocess warning", postprocessError?.message || postprocessError);
+    }
+    return res.json({
+      ok: true,
+      evidencia_id: evidenceId,
+      message: "Evidencia registrada desde cámara externa.",
+      warning: batchResult.driveUploadFailed ? "drive_upload_failed" : (batchResult.photoOverflow ? "evidence_photo_too_large_for_sheets" : undefined),
+    });
+  } catch (error) {
+    console.error("external-camera-upload error", error);
+    return res.status(500).json({ ok: false, error: error.message || "No se pudo subir la evidencia desde cámara externa." });
   }
 });
 
