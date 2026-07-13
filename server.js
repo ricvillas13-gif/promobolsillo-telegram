@@ -1,3 +1,4 @@
+// E023_EXTERNAL_CAMERA_WORKSPACE_BACKEND: cámara externa con contexto de captura variable y múltiples fotos por sesión.
 // E022_EXTERNAL_CAMERA_PHASE1_PWA_BACKEND: token temporal para módulo externo de cámara y registro directo de evidencia.
 // E020_BACKEND_SIN_CAMBIOS_FUNCIONALES: se conserva backend E019; cambios E020 son de UX frontend.
 // E019_BACKEND_PROMOTOR_OUT_OF_SERVICE_TODAY: endpoint promotor para consultar marcas sin servicio del dia y conservar soporte supervisor.
@@ -4113,7 +4114,6 @@ app.post("/miniapp/promotor/external-camera-session", async (req, res) => {
     const descripcion = norm(req.body?.descripcion);
     const visit = await getVisitById(visitaId);
     if (!visit || visit.promotor_id !== actor.profile.promotor_id) return res.status(404).json({ ok: false, error: "Visita no encontrada" });
-    if (!tipoEvidencia) return res.status(400).json({ ok: false, error: "tipo_evidencia requerido" });
     const marcaId = marcaIdRaw || (await resolveMarcaIdByName(marcaNombreRaw));
     const marcaNombre = marcaNombreRaw || (marcaId ? ((await getMarcaMap())[marcaId]?.marca_nombre || marcaId) : "");
     const tokenPayload = {
@@ -4147,17 +4147,27 @@ app.post("/miniapp/promotor/external-camera-session", async (req, res) => {
 app.post("/external-camera/context", async (req, res) => {
   try {
     const payload = verifyExternalCameraToken(req.body?.token);
+    const marcaMap = await getMarcaMap();
+    const tiendaMarcas = await getTiendaMarcasActivasByTiendaId(payload.tienda_id);
+    const marcas = tiendaMarcas
+      .map((item) => marcaMap[item.marca_id])
+      .filter((item) => item?.marca_id && item.activa !== false)
+      .map((item) => ({ marca_id: item.marca_id, marca_nombre: item.marca_nombre || item.marca_id }));
+    const tipos = await getTiposEvidenciaCatalog();
     return res.json({
       ok: true,
       context: {
+        visita_id: payload.visita_id || "",
         tienda_id: payload.tienda_id || "",
         tienda_nombre: payload.tienda_nombre || "",
-        marca_id: payload.marca_id || "",
-        marca_nombre: payload.marca_nombre || "",
-        tipo_evidencia: payload.tipo_evidencia || "",
+        marca_id: payload.marca_id || marcas[0]?.marca_id || "",
+        marca_nombre: payload.marca_nombre || (payload.marca_id ? (marcaMap[payload.marca_id]?.marca_nombre || payload.marca_id) : (marcas[0]?.marca_nombre || "")),
+        tipo_evidencia: payload.tipo_evidencia || tipos[0]?.tipo_evidencia || "",
         fase: payload.fase || "ESTADO_ACTUAL",
-        descripcion: payload.descripcion || "",
+        descripcion: norm(captureContext.descripcion) || payload.descripcion || "",
         expires_at: new Date(payload.exp).toISOString(),
+        marcas,
+        tipos: tipos.map((item) => ({ tipo_evidencia: item.tipo_evidencia, descripcion_corta: item.descripcion_corta || "" })),
       },
     });
   } catch (error) {
@@ -4169,15 +4179,20 @@ app.post("/external-camera/upload", async (req, res) => {
   try {
     const payload = verifyExternalCameraToken(req.body?.token);
     const photo = req.body?.photo || req.body?.foto || {};
+    const captureContext = req.body?.context || {};
     const photoName = fitCell(norm(photo?.name || `evidencia-externa-${Date.now()}.jpg`));
     const photoValue = norm(photo?.dataUrl || photo?.url || "");
     if (!photoValue) return res.status(400).json({ ok: false, error: "Foto requerida" });
     const visit = await getVisitById(payload.visita_id);
     if (!visit || visit.promotor_id !== payload.promotor_id) return res.status(404).json({ ok: false, error: "Visita no encontrada para esta cámara." });
-    const evidenciasActuales = await getEvidenciasByVisitId(payload.visita_id);
-    const existing = evidenciasActuales.find((item) => norm(item.note).includes(`EXTERNAL_CAMERA_TOKEN:${payload.token_id}`));
-    if (existing?.evidencia_id) {
-      return res.json({ ok: true, evidencia_id: existing.evidencia_id, message: "Esta foto ya había sido registrada." });
+    const marcaId = norm(captureContext.marca_id) || payload.marca_id || (await resolveMarcaIdByName(captureContext.marca_nombre || payload.marca_nombre || ""));
+    const marcaNombre = norm(captureContext.marca_nombre) || payload.marca_nombre || marcaId;
+    const tipoEvidencia = canonicalEvidenceTypeLabel(captureContext.tipo_evidencia || payload.tipo_evidencia);
+    if (!marcaId) return res.status(400).json({ ok: false, error: "Selecciona marca antes de registrar la foto." });
+    if (!tipoEvidencia) return res.status(400).json({ ok: false, error: "Selecciona tipo de evidencia antes de registrar la foto." });
+    const tiendaMarcas = await getTiendaMarcasActivasByTiendaId(payload.tienda_id);
+    if (tiendaMarcas.length && !tiendaMarcas.some((item) => item.marca_id === marcaId)) {
+      return res.status(400).json({ ok: false, error: "La marca seleccionada no corresponde a la tienda de esta visita." });
     }
     const evidenceId = `EV-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
     const rowPayload = {
@@ -4194,13 +4209,13 @@ app.post("/external-camera/upload", async (req, res) => {
       resultado_ai: "Pendiente",
       score_confianza: "0.90",
       riesgo: "BAJO",
-      marca_id: payload.marca_id || "",
+      marca_id: marcaId || "",
       producto_id: "",
-      tipo_evidencia: canonicalEvidenceTypeLabel(payload.tipo_evidencia),
+      tipo_evidencia: tipoEvidencia,
       descripcion: payload.descripcion || "",
       status: "RECIBIDA",
-      note: `EXTERNAL_CAMERA_PHASE1 | EXTERNAL_CAMERA_TOKEN:${payload.token_id}`,
-      fase: normalizeEvidencePhase(payload.fase, "ESTADO_ACTUAL"),
+      note: `EXTERNAL_CAMERA_WORKSPACE | EXTERNAL_CAMERA_SESSION:${payload.token_id} | MARCA:${marcaId} | TIPO:${tipoEvidencia}`,
+      fase: normalizeEvidencePhase(captureContext.fase || payload.fase, "ESTADO_ACTUAL"),
       foto_nombre: photoName,
       accuracy: "",
       requiere_revision_supervisor: "FALSE",
@@ -4216,7 +4231,7 @@ app.post("/external-camera/upload", async (req, res) => {
     };
     const batchResult = await registrarEvidenciasBatch([rowPayload]);
     try {
-      scheduleEvidenceGroupAnalysis({ visitaId: payload.visita_id, marcaId: payload.marca_id || "", tipoEvidencia: payload.tipo_evidencia, fase: payload.fase || "ESTADO_ACTUAL" });
+      scheduleEvidenceGroupAnalysis({ visitaId: payload.visita_id, marcaId: marcaId || "", tipoEvidencia, fase: captureContext.fase || payload.fase || "ESTADO_ACTUAL" });
       scheduleVisitTaskRecalculation(payload.visita_id);
     } catch (postprocessError) {
       console.warn("external-camera upload postprocess warning", postprocessError?.message || postprocessError);
@@ -4224,7 +4239,7 @@ app.post("/external-camera/upload", async (req, res) => {
     return res.json({
       ok: true,
       evidencia_id: evidenceId,
-      message: "Evidencia registrada desde cámara externa.",
+      message: "Foto registrada en PromoBolsillo.",
       warning: batchResult.driveUploadFailed ? "drive_upload_failed" : (batchResult.photoOverflow ? "evidence_photo_too_large_for_sheets" : undefined),
     });
   } catch (error) {
