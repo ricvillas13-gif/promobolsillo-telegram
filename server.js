@@ -1,3 +1,4 @@
+// E024C_RETURN_TO_MINIAPP_CAPTURE_BACKEND: sin cambios funcionales; conserva E024 backend.
 // E024B_FINALIZAR_SEGURO_Y_SIN_SERVICIO_CONTEXTUAL_BACKEND: sin cambios funcionales; conserva E024.
 // E024_EXTERNAL_CAMERA_UX_WORKSPACE_BACKEND: token extendido, anulación desde cámara externa y marca fuera de servicio desde workspace.
 // E023B_BACKEND_FIX_EXTERNAL_CAMERA_CONTEXT: corrige captureContext no definido al cargar marca/tipo en cámara externa.
