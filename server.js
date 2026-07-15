@@ -1,3 +1,8 @@
+// E024J_CAMERA_SESSION_3H_EXPIRED_SCREEN_BACKEND: token cámara externo 3 horas.
+// E024I_MIS_FOTOS_LAYOUT_ROWS_BACKEND: sin cambios funcionales; conserva backend E024.
+// E024G_BUILD_FIX_UNUSED_RETURN_BACKEND: sin cambios funcionales; conserva E024 backend.
+// E024F_UN_BOTON_VOLVER_REVISAR_BACKEND: sin cambios funcionales; conserva E024 backend.
+// E024E_FIX_BOT_USERNAME_RETURN_BACKEND: sin cambios funcionales; conserva E024 backend.
 // E024D_CLARIDAD_MIS_FOTOS_RETURN_BACKEND: sin cambios funcionales; conserva E024 backend.
 // E024C_RETURN_TO_MINIAPP_CAPTURE_BACKEND: sin cambios funcionales; conserva E024 backend.
 // E024B_FINALIZAR_SEGURO_Y_SIN_SERVICIO_CONTEXTUAL_BACKEND: sin cambios funcionales; conserva E024.
@@ -41,7 +46,7 @@ const EVPLUS_MIN_DIMENSION = 420;
 const EVPLUS_MIN_ESTIMATED_BYTES = 9000;
 const PHOTO_CELL_LIMIT = 48000;
 const MARCAS_FUERA_SERVICIO_SHEET = "MARCAS_FUERA_SERVICIO";
-const EXTERNAL_CAMERA_TOKEN_TTL_MS = 45 * 60 * 1000;
+const EXTERNAL_CAMERA_TOKEN_TTL_MS = 3 * 60 * 60 * 1000;
 
 const MARCAS_FUERA_SERVICIO_HEADER = [
   "registro_id",
@@ -232,7 +237,7 @@ function verifyExternalCameraToken(token = "") {
   } catch {
     throw new Error("Token de cámara inválido.");
   }
-  if (!payload?.exp || Date.now() > safeNum(payload.exp, 0)) throw new Error("La sesión de cámara expiró. Vuelve a abrir la cámara desde PromoBolsillo.");
+  if (!payload?.exp || Date.now() > safeNum(payload.exp, 0)) throw new Error("La sesión de cámara expiró. Cierra esta pantalla y abre nuevamente la cámara desde Capturar evidencias.");
   return payload;
 }
 
