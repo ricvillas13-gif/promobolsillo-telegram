@@ -1,3 +1,4 @@
+﻿// E025_FECHAS_CDMX: timestamps ISO con offset America/Mexico_City, spreadsheet timezone y formato operativo CDMX.
 // E024J_CAMERA_SESSION_3H_EXPIRED_SCREEN_BACKEND: token cámara externo 3 horas.
 // E024I_MIS_FOTOS_LAYOUT_ROWS_BACKEND: sin cambios funcionales; conserva backend E024.
 // E024G_BUILD_FIX_UNUSED_RETURN_BACKEND: sin cambios funcionales; conserva E024 backend.
@@ -41,7 +42,7 @@ app.use(bodyParser.urlencoded({ extended: false, limit: "35mb" }));
 
 const TELEGRAM_API = TELEGRAM_BOT_TOKEN ? `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}` : "";
 const EVPLUS_VERSION = "EVPLUS_V1";
-const PROMOBOLSILLO_DEPLOY_VERSION = "E022_EXTERNAL_CAMERA_PHASE1_PWA";
+const PROMOBOLSILLO_DEPLOY_VERSION = "E025_FECHAS_CDMX";
 const EVPLUS_MIN_DIMENSION = 420;
 const EVPLUS_MIN_ESTIMATED_BYTES = 9000;
 const PHOTO_CELL_LIMIT = 48000;
@@ -171,8 +172,28 @@ function todayISO() {
   return ymdInTZ(new Date(), APP_TZ);
 }
 
+function isoInTZ(date = new Date(), tz = APP_TZ) {
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+    timeZoneName: "longOffset",
+  });
+  const parts = Object.fromEntries(
+    formatter.formatToParts(date).map(({ type, value }) => [type, value]),
+  );
+  const offset = String(parts.timeZoneName || "GMT+00:00").replace(/^GMT/, "") || "+00:00";
+  const milliseconds = String(date.getMilliseconds()).padStart(3, "0");
+  return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}:${parts.second}.${milliseconds}${offset}`;
+}
+
 function nowISO() {
-  return new Date().toISOString();
+  return isoInTZ(new Date(), APP_TZ);
 }
 
 function buildExternalIdFromTelegramUser(userId) {
@@ -749,10 +770,35 @@ function writeActorCache(externalId, value) {
   });
 }
 
+let spreadsheetTimeZoneEnsured = false;
+
+async function ensureSpreadsheetTimeZone(sheets) {
+  if (spreadsheetTimeZoneEnsured) return;
+  const metadata = await sheets.spreadsheets.get({
+    spreadsheetId: SHEET_ID,
+    fields: "properties.timeZone",
+  });
+  const currentTimeZone = norm(metadata.data?.properties?.timeZone);
+  if (currentTimeZone !== APP_TZ) {
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: SHEET_ID,
+      requestBody: {
+        requests: [{
+          updateSpreadsheetProperties: {
+            properties: { timeZone: APP_TZ },
+            fields: "timeZone",
+          },
+        }],
+      },
+    });
+  }
+  spreadsheetTimeZoneEnsured = true;
+}
 async function getSheetsClient() {
   if (sheetsClient) return sheetsClient;
   const client = await getGoogleAuthClient();
   sheetsClient = google.sheets({ version: "v4", auth: client });
+  await ensureSpreadsheetTimeZone(sheetsClient);
   return sheetsClient;
 }
 
