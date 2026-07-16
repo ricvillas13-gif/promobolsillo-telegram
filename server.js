@@ -1,3 +1,4 @@
+// E027_FIX4_PREDEPLOY: preserva metadatos al revisar y expone diagnóstico /health.
 // E027_CALIDAD_FOTOGRAFICA_CLOUDINARY: fotos nuevas hasta 1280 px; archivo externo Cloudinary; Sheets conserva URL y metadatos; sin retroalimentación al promotor.
 // E025_FECHAS_CDMX: timestamps ISO con offset America/Mexico_City, spreadsheet timezone y formato operativo CDMX.
 // E024J_CAMERA_SESSION_3H_EXPIRED_SCREEN_BACKEND: token cámara externo 3 horas.
@@ -31,7 +32,13 @@ const {
   PUBLIC_BASE_URL,
   OPS_TOKEN,
   GOOGLE_DRIVE_EVIDENCE_FOLDER_ID,
-  DRIVE_EVIDENCE_FOLDER_ID, PHOTO_STORAGE_PROVIDER = "LEGACY", CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET, CLOUDINARY_FOLDER = "promobolsillo/evidencias", } = process.env;
+  DRIVE_EVIDENCE_FOLDER_ID,
+  PHOTO_STORAGE_PROVIDER = "LEGACY",
+  CLOUDINARY_CLOUD_NAME,
+  CLOUDINARY_API_KEY,
+  CLOUDINARY_API_SECRET,
+  CLOUDINARY_FOLDER = "promobolsillo/evidencias",
+} = process.env;
 
 if (!SHEET_ID) throw new Error("Missing SHEET_ID");
 if (!GOOGLE_SERVICE_ACCOUNT_JSON) throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_JSON");
@@ -64,7 +71,11 @@ const MARCAS_FUERA_SERVICIO_HEADER = [
   "accuracy",
   "estatus",
 ];
-const EVIDENCE_DRIVE_FOLDER_ID = GOOGLE_DRIVE_EVIDENCE_FOLDER_ID || DRIVE_EVIDENCE_FOLDER_ID || ""; const PHOTO_STORAGE_PROVIDER_NORMALIZED = String(PHOTO_STORAGE_PROVIDER || "LEGACY").trim().toUpperCase(); const CLOUDINARY_ENABLED = !!(CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET); const E027_REVIEW_MAX_SIDE = 1280; const E027_REVIEW_JPEG_QUALITY = 82;
+const EVIDENCE_DRIVE_FOLDER_ID = GOOGLE_DRIVE_EVIDENCE_FOLDER_ID || DRIVE_EVIDENCE_FOLDER_ID || "";
+const PHOTO_STORAGE_PROVIDER_NORMALIZED = String(PHOTO_STORAGE_PROVIDER || "LEGACY").trim().toUpperCase();
+const CLOUDINARY_ENABLED = !!(CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET);
+const E027_REVIEW_MAX_SIDE = 1280;
+const E027_REVIEW_JPEG_QUALITY = 82;
 const pendingEvidenceAnalysisTimers = new Map();
 const pendingVisitTaskRecalcTimers = new Map();
 const SHEET_READ_CACHE_DEFAULT_TTL_MS = 45000;
@@ -447,6 +458,22 @@ function appendPhotoStorageNote(baseNote, photoMeta = {}, storage = "INLINE", fi
   if (fileId) parts.push(`PHOTO_FILE_ID:${fileId}`);
   if (width || height || bytes || mime) parts.push(`IMG_META:${width}x${height}|${bytes}|${mime || "application/octet-stream"}`);
   return fitCell(parts.filter(Boolean).join(" | "));
+}
+
+function isPhotoStorageNotePart(value = "") {
+  return /^(PHOTO_STORAGE|PHOTO_FILE_ID|IMG_META):/i.test(norm(value));
+}
+
+function mergeEvidenceNotePreservingPhotoMeta(nextNote = "", existingNote = "") {
+  const userParts = norm(nextNote)
+    .split(/\s+\|\s+/)
+    .map((part) => norm(part))
+    .filter((part) => part && !isPhotoStorageNotePart(part));
+  const technicalParts = norm(existingNote)
+    .split(/\s+\|\s+/)
+    .map((part) => norm(part))
+    .filter((part) => part && isPhotoStorageNotePart(part));
+  return fitCell(unique([...userParts, ...technicalParts]).join(" | "));
 }
 
 function mimeExtensionFromMime(mime = "") {
@@ -1823,18 +1850,44 @@ async function registrarEvidenciasBatch(payloads = []) {
 async function updateEvidenceRow(header, evidence, patch = {}) {
   const next = { ...evidence, ...patch };
   next.tipo_evidencia = canonicalEvidenceTypeLabel(next.tipo_evidencia);
-  const photoInfo = await materializePhotoStorage(next.url_foto ?? evidence.url_foto, next.foto_nombre || evidence.foto_nombre || "evidencia.jpg", next.note ?? evidence.note);
-  next.url_foto = photoInfo.value;
-  next.note = photoInfo.note;
-  const row = buildEvidenceRowFromHeader(header, next);
-  await updateSheetValues(`EVIDENCIAS!A${evidence.rowIndex}:${headerRangeEnd(header.length)}${evidence.rowIndex}`, [row]);
-  return {
-    photoOverflow: photoInfo.overflow,
-    originalPhotoLength: photoInfo.originalLength,
-    storedExternally: photoInfo.storedExternally,
-    driveUploadFailed: photoInfo.driveUploadFailed,
-    driveUploadError: photoInfo.driveUploadError || "",
+
+  const hasPhotoPatch = Object.prototype.hasOwnProperty.call(patch, "url_foto");
+  let photoResult = {
+    photoOverflow: false,
+    originalPhotoLength: norm(evidence.url_foto).length,
+    storedExternally: /^https?:/i.test(norm(evidence.url_foto)),
+    driveUploadFailed: false,
+    driveUploadError: "",
   };
+
+  if (hasPhotoPatch) {
+    const photoInfo = await materializePhotoStorage(
+      patch.url_foto,
+      next.foto_nombre || evidence.foto_nombre || "evidencia.jpg",
+      Object.prototype.hasOwnProperty.call(patch, "note") ? patch.note : evidence.note,
+    );
+    next.url_foto = photoInfo.value;
+    next.note = photoInfo.note;
+    photoResult = {
+      photoOverflow: photoInfo.overflow,
+      originalPhotoLength: photoInfo.originalLength,
+      storedExternally: photoInfo.storedExternally,
+      driveUploadFailed: photoInfo.driveUploadFailed,
+      driveUploadError: photoInfo.driveUploadError || "",
+    };
+  } else {
+    next.url_foto = evidence.url_foto;
+    next.note = Object.prototype.hasOwnProperty.call(patch, "note")
+      ? mergeEvidenceNotePreservingPhotoMeta(patch.note, evidence.note)
+      : evidence.note;
+  }
+
+  const row = buildEvidenceRowFromHeader(header, next);
+  await updateSheetValues(
+    `EVIDENCIAS!A${evidence.rowIndex}:${headerRangeEnd(header.length)}${evidence.rowIndex}`,
+    [row],
+  );
+  return photoResult;
 }
 
 async function getMarcasActivas() {
@@ -3583,7 +3636,12 @@ app.get("/health", async (_req, res) => {
     version: PROMOBOLSILLO_DEPLOY_VERSION,
     now: nowISO(),
     drive_evidence_folder_configured: !!EVIDENCE_DRIVE_FOLDER_ID,
-    demo_inline_fallback_enabled: true,
+    photo_storage_provider: PHOTO_STORAGE_PROVIDER_NORMALIZED,
+    cloudinary_configured: CLOUDINARY_ENABLED,
+    cloudinary_folder_configured: !!norm(CLOUDINARY_FOLDER),
+    e027_review_max_side: E027_REVIEW_MAX_SIDE,
+    e027_review_jpeg_quality: E027_REVIEW_JPEG_QUALITY,
+    demo_inline_fallback_enabled: PHOTO_STORAGE_PROVIDER_NORMALIZED !== "CLOUDINARY",
     rezgo_e014_flexible_evidence_types: true,
     image_viewer_escape_enabled: true,
     cancel_evidence_refresh_enabled: true,
