@@ -1,4 +1,5 @@
-﻿// E025_FECHAS_CDMX: timestamps ISO con offset America/Mexico_City, spreadsheet timezone y formato operativo CDMX.
+// E027_CALIDAD_FOTOGRAFICA_CLOUDINARY: fotos nuevas hasta 1280 px; archivo externo Cloudinary; Sheets conserva URL y metadatos; sin retroalimentación al promotor.
+// E025_FECHAS_CDMX: timestamps ISO con offset America/Mexico_City, spreadsheet timezone y formato operativo CDMX.
 // E024J_CAMERA_SESSION_3H_EXPIRED_SCREEN_BACKEND: token cámara externo 3 horas.
 // E024I_MIS_FOTOS_LAYOUT_ROWS_BACKEND: sin cambios funcionales; conserva backend E024.
 // E024G_BUILD_FIX_UNUSED_RETURN_BACKEND: sin cambios funcionales; conserva E024 backend.
@@ -30,8 +31,7 @@ const {
   PUBLIC_BASE_URL,
   OPS_TOKEN,
   GOOGLE_DRIVE_EVIDENCE_FOLDER_ID,
-  DRIVE_EVIDENCE_FOLDER_ID,
-} = process.env;
+  DRIVE_EVIDENCE_FOLDER_ID, PHOTO_STORAGE_PROVIDER = "LEGACY", CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET, CLOUDINARY_FOLDER = "promobolsillo/evidencias", } = process.env;
 
 if (!SHEET_ID) throw new Error("Missing SHEET_ID");
 if (!GOOGLE_SERVICE_ACCOUNT_JSON) throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_JSON");
@@ -42,7 +42,7 @@ app.use(bodyParser.urlencoded({ extended: false, limit: "35mb" }));
 
 const TELEGRAM_API = TELEGRAM_BOT_TOKEN ? `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}` : "";
 const EVPLUS_VERSION = "EVPLUS_V1";
-const PROMOBOLSILLO_DEPLOY_VERSION = "E025_FECHAS_CDMX";
+const PROMOBOLSILLO_DEPLOY_VERSION = "E027_CALIDAD_FOTOGRAFICA_CLOUDINARY";
 const EVPLUS_MIN_DIMENSION = 420;
 const EVPLUS_MIN_ESTIMATED_BYTES = 9000;
 const PHOTO_CELL_LIMIT = 48000;
@@ -64,7 +64,7 @@ const MARCAS_FUERA_SERVICIO_HEADER = [
   "accuracy",
   "estatus",
 ];
-const EVIDENCE_DRIVE_FOLDER_ID = GOOGLE_DRIVE_EVIDENCE_FOLDER_ID || DRIVE_EVIDENCE_FOLDER_ID || "";
+const EVIDENCE_DRIVE_FOLDER_ID = GOOGLE_DRIVE_EVIDENCE_FOLDER_ID || DRIVE_EVIDENCE_FOLDER_ID || ""; const PHOTO_STORAGE_PROVIDER_NORMALIZED = String(PHOTO_STORAGE_PROVIDER || "LEGACY").trim().toUpperCase(); const CLOUDINARY_ENABLED = !!(CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET); const E027_REVIEW_MAX_SIDE = 1280; const E027_REVIEW_JPEG_QUALITY = 82;
 const pendingEvidenceAnalysisTimers = new Map();
 const pendingVisitTaskRecalcTimers = new Map();
 const SHEET_READ_CACHE_DEFAULT_TTL_MS = 45000;
@@ -524,9 +524,84 @@ async function uploadPhotoDataUrlToDrive(photoValue, photoName = "") {
   return { fileId, url: buildDrivePublicUrl(fileId) };
 }
 
+function sanitizeCloudinaryError(error) {
+  const raw = [
+    error?.message,
+    error?.response?.data?.error?.message,
+    error?.cloudinary?.error?.message,
+  ].filter(Boolean).join(" | ") || "CLOUDINARY_UPLOAD_ERROR";
+  return fitCell(raw.replace(/api_secret[^|]+/ig, "api_secret:[redacted]").slice(0, 240));
+}
+function buildCloudinarySignature(params = {}) {
+  const canonical = Object.keys(params)
+    .filter((key) => params[key] !== undefined && params[key] !== null && String(params[key]) !== "")
+    .sort()
+    .map((key) => `${key}=${params[key]}`)
+    .join("&");
+  return crypto.createHash("sha1").update(`${canonical}${CLOUDINARY_API_SECRET}`).digest("hex");
+}
+async function uploadPhotoDataUrlToCloudinary(photoValue, photoName = "") {
+  const parsed = parseDataUrl(photoValue);
+  if (!parsed) return null;
+  if (!CLOUDINARY_ENABLED) throw new Error("Cloudinary no está configurado en Render.");
+  const timestamp = Math.floor(Date.now() / 1000);
+  const signedParams = { timestamp };
+  if (norm(CLOUDINARY_FOLDER)) signedParams.folder = norm(CLOUDINARY_FOLDER);
+  const signature = buildCloudinarySignature(signedParams);
+  const form = new FormData();
+  form.append("file", photoValue);
+  form.append("api_key", norm(CLOUDINARY_API_KEY));
+  form.append("timestamp", String(timestamp));
+  form.append("signature", signature);
+  if (signedParams.folder) form.append("folder", signedParams.folder);
+  const endpoint = `https://api.cloudinary.com/v1_1/${encodeURIComponent(norm(CLOUDINARY_CLOUD_NAME))}/image/upload`;
+  const response = await fetch(endpoint, { method: "POST", body: form });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || !payload?.secure_url) {
+    const message = payload?.error?.message || `Cloudinary HTTP ${response.status}`;
+    const error = new Error(message);
+    error.cloudinary = payload;
+    throw error;
+  }
+  return {
+    url: norm(payload.secure_url),
+    publicId: norm(payload.public_id),
+    width: safeInt(payload.width, 0),
+    height: safeInt(payload.height, 0),
+    bytes: safeInt(payload.bytes, parsed.buffer.length),
+    mime: payload.format ? `image/${norm(payload.format)}` : parsed.mime,
+  };
+}
 async function materializePhotoStorage(photoValue, photoName = "", baseNote = "") {
   const originalLength = norm(photoValue).length;
   const photoMeta = getImageMeta(photoValue);
+  if (norm(photoValue).startsWith("data:") && PHOTO_STORAGE_PROVIDER_NORMALIZED === "CLOUDINARY") {
+    if (!CLOUDINARY_ENABLED) {
+      throw new Error("E027: Cloudinary no está configurado. Revisa CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY y CLOUDINARY_API_SECRET en Render.");
+    }
+    try {
+      const upload = await uploadPhotoDataUrlToCloudinary(photoValue, photoName);
+      if (!upload?.url) throw new Error("Cloudinary no devolvió secure_url.");
+      const uploadedMeta = {
+        mime: upload.mime || photoMeta.mime,
+        width: upload.width || photoMeta.width,
+        height: upload.height || photoMeta.height,
+        estimated_bytes: upload.bytes || photoMeta.estimated_bytes,
+      };
+      return {
+        value: upload.url,
+        note: appendPhotoStorageNote(baseNote, uploadedMeta, "CLOUDINARY", upload.publicId),
+        overflow: false,
+        originalLength,
+        storedExternally: true,
+        cloudinaryPublicId: upload.publicId,
+      };
+    } catch (error) {
+      const cloudinaryError = sanitizeCloudinaryError(error);
+      console.error("materializePhotoStorage Cloudinary error", cloudinaryError);
+      throw new Error(`No se pudo guardar la fotografía con calidad de revisión. Reintenta. Detalle: ${cloudinaryError}`);
+    }
+  }
   if (norm(photoValue).startsWith("data:")) {
     try {
       const upload = await uploadPhotoDataUrlToDrive(photoValue, photoName);
