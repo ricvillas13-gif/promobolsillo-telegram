@@ -1,3 +1,4 @@
+// E028_SUPERVISOR_CARGA_PROGRESIVA: lista liviana, miniaturas Cloudinary y foto histórica bajo demanda.
 // E027_FIX4_PREDEPLOY: preserva metadatos al revisar y expone diagnóstico /health.
 // E027_CALIDAD_FOTOGRAFICA_CLOUDINARY: fotos nuevas hasta 1280 px; archivo externo Cloudinary; Sheets conserva URL y metadatos; sin retroalimentación al promotor.
 // E025_FECHAS_CDMX: timestamps ISO con offset America/Mexico_City, spreadsheet timezone y formato operativo CDMX.
@@ -49,7 +50,7 @@ app.use(bodyParser.urlencoded({ extended: false, limit: "35mb" }));
 
 const TELEGRAM_API = TELEGRAM_BOT_TOKEN ? `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}` : "";
 const EVPLUS_VERSION = "EVPLUS_V1";
-const PROMOBOLSILLO_DEPLOY_VERSION = "E027_CALIDAD_FOTOGRAFICA_CLOUDINARY";
+const PROMOBOLSILLO_DEPLOY_VERSION = "E028_SUPERVISOR_CARGA_PROGRESIVA";
 const EVPLUS_MIN_DIMENSION = 420;
 const EVPLUS_MIN_ESTIMATED_BYTES = 9000;
 const PHOTO_CELL_LIMIT = 48000;
@@ -76,6 +77,9 @@ const PHOTO_STORAGE_PROVIDER_NORMALIZED = String(PHOTO_STORAGE_PROVIDER || "LEGA
 const CLOUDINARY_ENABLED = !!(CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET);
 const E027_REVIEW_MAX_SIDE = 1280;
 const E027_REVIEW_JPEG_QUALITY = 82;
+const E028_SUPERVISOR_THUMB_WIDTH = 320;
+const E028_SUPERVISOR_THUMB_HEIGHT = 220;
+const E028_SUPERVISOR_REVIEW_WIDTH = 1280;
 const pendingEvidenceAnalysisTimers = new Map();
 const pendingVisitTaskRecalcTimers = new Map();
 const SHEET_READ_CACHE_DEFAULT_TTL_MS = 45000;
@@ -2794,6 +2798,81 @@ function buildEvidenceView(item, marcaMap, visitMap, tiendaMap, promotorMap) {
   };
 }
 
+function isRemotePhotoUrl(value) {
+  return /^https?:\/\//i.test(norm(value));
+}
+
+function isCloudinaryDeliveryUrl(value) {
+  const photo = norm(value);
+  return /^https?:\/\/res\.cloudinary\.com\//i.test(photo) && photo.includes("/image/upload/");
+}
+
+function buildCloudinaryVariantUrl(value, transformation) {
+  const photo = norm(value);
+  const marker = "/image/upload/";
+  const markerIndex = photo.indexOf(marker);
+  if (!photo || markerIndex < 0 || !transformation) return photo;
+  const prefix = photo.slice(0, markerIndex + marker.length);
+  const suffix = photo.slice(markerIndex + marker.length);
+  return `${prefix}${transformation}/${suffix}`;
+}
+
+function getStoredPhotoProvider(evidence) {
+  const note = norm(evidence?.note);
+  const match = note.match(/(?:^|\s*\|\s*)PHOTO_STORAGE:([^|]+)/i);
+  if (match?.[1]) return upper(match[1]);
+  const photo = norm(evidence?.url_foto);
+  if (isCloudinaryDeliveryUrl(photo)) return "CLOUDINARY";
+  if (photo.startsWith("data:")) return "LEGACY_INLINE";
+  if (isRemotePhotoUrl(photo)) return "REMOTE";
+  return photo ? "OTHER" : "NONE";
+}
+
+function getSupervisorPhotoDelivery(evidence) {
+  const original = norm(evidence?.url_foto);
+  const cloudinary = isCloudinaryDeliveryUrl(original);
+  const remote = isRemotePhotoUrl(original);
+  const inline = original.startsWith("data:");
+  const thumbUrl = cloudinary
+    ? buildCloudinaryVariantUrl(
+        original,
+        `f_auto,q_auto:eco,c_fill,g_auto,w_${E028_SUPERVISOR_THUMB_WIDTH},h_${E028_SUPERVISOR_THUMB_HEIGHT}`,
+      )
+    : remote
+      ? original
+      : "";
+  const reviewUrl = cloudinary
+    ? buildCloudinaryVariantUrl(
+        original,
+        `f_auto,q_auto:good,c_limit,w_${E028_SUPERVISOR_REVIEW_WIDTH}`,
+      )
+    : remote
+      ? original
+      : "";
+  return {
+    original,
+    thumbUrl,
+    reviewUrl,
+    photoAvailable: !!original && original !== "[IMAGE_TOO_LARGE_FOR_SHEETS]",
+    photoDeferred: inline,
+    photoStorage: getStoredPhotoProvider(evidence),
+  };
+}
+
+function buildSupervisorEvidenceListView(item, marcaMap, visitMap, tiendaMap, promotorMap) {
+  const view = buildEvidenceView(item, marcaMap, visitMap, tiendaMap, promotorMap);
+  const delivery = getSupervisorPhotoDelivery(item);
+  return {
+    ...view,
+    url_foto: delivery.reviewUrl,
+    thumb_url: delivery.thumbUrl,
+    photo_available: delivery.photoAvailable,
+    photo_deferred: delivery.photoDeferred,
+    photo_storage: delivery.photoStorage,
+    photo_bytes_estimate: estimateBytesFromEvidenceRow(item),
+  };
+}
+
 function evidenceStatusForAnalysis(evidence, requiresReview) {
   const current = upper(evidence.status || "RECIBIDA");
   if (["APROBADA", "RECHAZADA"].includes(current)) return current;
@@ -3641,6 +3720,11 @@ app.get("/health", async (_req, res) => {
     cloudinary_folder_configured: !!norm(CLOUDINARY_FOLDER),
     e027_review_max_side: E027_REVIEW_MAX_SIDE,
     e027_review_jpeg_quality: E027_REVIEW_JPEG_QUALITY,
+    e028_supervisor_progressive_loading: true,
+    e028_supervisor_thumb_width: E028_SUPERVISOR_THUMB_WIDTH,
+    e028_supervisor_thumb_height: E028_SUPERVISOR_THUMB_HEIGHT,
+    e028_supervisor_review_width: E028_SUPERVISOR_REVIEW_WIDTH,
+    e028_legacy_photo_on_demand: true,
     demo_inline_fallback_enabled: PHOTO_STORAGE_PROVIDER_NORMALIZED !== "CLOUDINARY",
     rezgo_e014_flexible_evidence_types: true,
     image_viewer_escape_enabled: true,
@@ -4841,10 +4925,55 @@ app.post("/miniapp/supervisor/evidences", async (req, res) => {
     if (tipoFilter) evidences = evidences.filter((item) => evidenceTypeKey(item.tipo_evidencia) === evidenceTypeKey(tipoFilter));
     if (riesgoFilter) evidences = evidences.filter((item) => upper(item.riesgo) === riesgoFilter);
     evidences.sort((a, b) => String(b.fecha_hora).localeCompare(String(a.fecha_hora)));
-    const visible = evidences.map((item) => buildEvidenceView(item, marcaMap, visitMap, tiendaMap, promotorMap));
-    return res.json({ ok: true, evidences: visible });
+    const visible = evidences.map((item) => buildSupervisorEvidenceListView(item, marcaMap, visitMap, tiendaMap, promotorMap));
+    return res.json({
+      ok: true,
+      evidences: visible,
+      meta: {
+        total: visible.length,
+        deferred_photos: visible.filter((item) => item.photo_deferred).length,
+        remote_photos: visible.filter((item) => !!item.thumb_url).length,
+        payload_mode: "METADATA_AND_THUMBNAILS",
+      },
+    });
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message || "supervisor evidences error" });
+  }
+});
+
+app.post("/miniapp/supervisor/evidence-photo", async (req, res) => {
+  try {
+    const { actor } = await getActorFromRequest(req);
+    if (actor.role !== "supervisor") return res.status(403).json({ ok: false, error: "Solo supervisor" });
+    const evidenciaId = norm(req.body?.evidencia_id);
+    if (!evidenciaId) return res.status(400).json({ ok: false, error: "Falta evidencia_id" });
+
+    const found = await getEvidenceById(evidenciaId);
+    if (!found) return res.status(404).json({ ok: false, error: "Evidencia no encontrada" });
+
+    const team = await getPromotoresDeSupervisor(actor.profile.external_id);
+    const promotorIds = new Set(team.map((item) => item.promotor_id));
+    const visit = await getVisitById(found.evidence.visita_id);
+    if (!visit || !promotorIds.has(visit.promotor_id)) {
+      return res.status(403).json({ ok: false, error: "No autorizada" });
+    }
+
+    const delivery = getSupervisorPhotoDelivery(found.evidence);
+    if (!delivery.photoAvailable) {
+      return res.status(404).json({ ok: false, error: "La evidencia no tiene fotografía disponible" });
+    }
+
+    res.header("Cache-Control", "private, max-age=300");
+    return res.json({
+      ok: true,
+      evidencia_id: evidenciaId,
+      url_foto: delivery.reviewUrl || delivery.original,
+      thumb_url: delivery.thumbUrl || delivery.reviewUrl || delivery.original,
+      photo_deferred: delivery.photoDeferred,
+      photo_storage: delivery.photoStorage,
+    });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message || "supervisor evidence photo error" });
   }
 });
 
