@@ -1,3 +1,4 @@
+// E028_FIX1_CUOTA_SHEETS: agrupa escrituras, reintenta límites temporales y evita mensajes técnicos al promotor.
 // E028_SUPERVISOR_CARGA_PROGRESIVA: lista liviana, miniaturas Cloudinary y foto histórica bajo demanda.
 // E027_FIX4_PREDEPLOY: preserva metadatos al revisar y expone diagnóstico /health.
 // E027_CALIDAD_FOTOGRAFICA_CLOUDINARY: fotos nuevas hasta 1280 px; archivo externo Cloudinary; Sheets conserva URL y metadatos; sin retroalimentación al promotor.
@@ -50,7 +51,7 @@ app.use(bodyParser.urlencoded({ extended: false, limit: "35mb" }));
 
 const TELEGRAM_API = TELEGRAM_BOT_TOKEN ? `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}` : "";
 const EVPLUS_VERSION = "EVPLUS_V1";
-const PROMOBOLSILLO_DEPLOY_VERSION = "E028_SUPERVISOR_CARGA_PROGRESIVA";
+const PROMOBOLSILLO_DEPLOY_VERSION = "E028_FIX1_CUOTA_SHEETS";
 const EVPLUS_MIN_DIMENSION = 420;
 const EVPLUS_MIN_ESTIMATED_BYTES = 9000;
 const PHOTO_CELL_LIMIT = 48000;
@@ -80,6 +81,8 @@ const E027_REVIEW_JPEG_QUALITY = 82;
 const E028_SUPERVISOR_THUMB_WIDTH = 320;
 const E028_SUPERVISOR_THUMB_HEIGHT = 220;
 const E028_SUPERVISOR_REVIEW_WIDTH = 1280;
+const SHEETS_WRITE_RETRY_ATTEMPTS = 6;
+const SHEETS_WRITE_MAX_BACKOFF_MS = 32000;
 const pendingEvidenceAnalysisTimers = new Map();
 const pendingVisitTaskRecalcTimers = new Map();
 const SHEET_READ_CACHE_DEFAULT_TTL_MS = 45000;
@@ -843,20 +846,56 @@ function isQuotaExceededError(error) {
   const pieces = [
     error?.message,
     error?.response?.data?.error?.message,
-    Array.isArray(error?.errors) ? error.errors.map((item) => item?.message).join(" | ") : "",
+    error?.response?.data?.error?.status,
+    Array.isArray(error?.errors) ? error.errors.map((item) => `${item?.reason || ""} ${item?.message || ""}`).join(" | ") : "",
   ].filter(Boolean).join(" | ").toLowerCase();
-  return pieces.includes("quota exceeded") || pieces.includes("read requests per minute per user");
+  const status = Number(error?.response?.status || error?.code || 0);
+  return status === 429
+    || pieces.includes("quota exceeded")
+    || pieces.includes("rate limit exceeded")
+    || pieces.includes("ratelimitexceeded")
+    || pieces.includes("userratelimitexceeded")
+    || pieces.includes("read requests per minute")
+    || pieces.includes("write requests per minute")
+    || pieces.includes("too many requests");
 }
 
 function buildFriendlySheetsError(error, range = "") {
   if (isQuotaExceededError(error)) {
-    const friendly = new Error("Servicio temporalmente saturado por límite temporal de Google Sheets. Espera 30 a 60 segundos y vuelve a intentar.");
+    const friendly = new Error("La evidencia está esperando confirmación. Google se encuentra momentáneamente ocupado; Promobolsillo reintentará automáticamente.");
     friendly.statusCode = 503;
     friendly.isQuotaExceeded = true;
     friendly.range = range;
     return friendly;
   }
   return error;
+}
+
+function waitForSheetsRetry(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function runSheetsWriteWithBackoff(operation, context = "") {
+  let lastError = null;
+  for (let attempt = 0; attempt < SHEETS_WRITE_RETRY_ATTEMPTS; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      if (!isQuotaExceededError(error)) throw error;
+      if (attempt >= SHEETS_WRITE_RETRY_ATTEMPTS - 1) break;
+      const exponential = Math.min(1000 * (2 ** attempt), SHEETS_WRITE_MAX_BACKOFF_MS);
+      const jitter = Math.floor(Math.random() * 750);
+      const delayMs = exponential + jitter;
+      console.warn("Google Sheets write quota; retry scheduled", {
+        context,
+        attempt: attempt + 1,
+        delay_ms: delayMs,
+      });
+      await waitForSheetsRetry(delayMs);
+    }
+  }
+  throw buildFriendlySheetsError(lastError, context);
 }
 
 function readActorCache(externalId) {
@@ -936,24 +975,59 @@ async function getSheetValues(range, options = {}) {
 
 async function appendSheetValues(range, values) {
   const sheets = await getSheetsClient();
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: SHEET_ID,
-    range,
-    valueInputOption: "USER_ENTERED",
-    requestBody: { values },
-  });
-  invalidateSheetCache(range);
+  try {
+    await runSheetsWriteWithBackoff(
+      () => sheets.spreadsheets.values.append({
+        spreadsheetId: SHEET_ID,
+        range,
+        valueInputOption: "USER_ENTERED",
+        requestBody: { values },
+      }),
+      `append:${range}`,
+    );
+    invalidateSheetCache(range);
+  } catch (error) {
+    throw buildFriendlySheetsError(error, range);
+  }
 }
 
 async function updateSheetValues(range, values) {
   const sheets = await getSheetsClient();
-  await sheets.spreadsheets.values.update({
-    spreadsheetId: SHEET_ID,
-    range,
-    valueInputOption: "USER_ENTERED",
-    requestBody: { values },
-  });
-  invalidateSheetCache(range);
+  try {
+    await runSheetsWriteWithBackoff(
+      () => sheets.spreadsheets.values.update({
+        spreadsheetId: SHEET_ID,
+        range,
+        valueInputOption: "USER_ENTERED",
+        requestBody: { values },
+      }),
+      `update:${range}`,
+    );
+    invalidateSheetCache(range);
+  } catch (error) {
+    throw buildFriendlySheetsError(error, range);
+  }
+}
+
+async function batchUpdateSheetValues(data = []) {
+  if (!Array.isArray(data) || !data.length) return;
+  const sheets = await getSheetsClient();
+  try {
+    await runSheetsWriteWithBackoff(
+      () => sheets.spreadsheets.values.batchUpdate({
+        spreadsheetId: SHEET_ID,
+        requestBody: {
+          valueInputOption: "USER_ENTERED",
+          data,
+        },
+      }),
+      `batchUpdate:${data.length}`,
+    );
+    const sheetNames = new Set(data.map((item) => sheetNameFromRange(item.range)).filter(Boolean));
+    for (const sheetName of sheetNames) invalidateSheetCache(sheetName);
+  } catch (error) {
+    throw buildFriendlySheetsError(error, "batchUpdate");
+  }
 }
 
 async function getSheetHeader(sheetName) {
@@ -2481,14 +2555,22 @@ async function recalculateTareasForVisita(visitaId) {
   const marcasFueraServicio = await getMarcasFueraServicioByVisitId(visitaId);
   const marcasFueraServicioSet = new Set(marcasFueraServicio.map((item) => upper(item.marca_id)).filter(Boolean));
   const updated = [];
+  const writes = [];
+
   for (const task of tareas) {
     const counters = countAntesDespuesForTask(evidences, task);
     const resolved = marcasFueraServicioSet.has(upper(task.marca_id))
       ? { estatus: "FUERA_SERVICIO", total_fotos_cargadas: counters.total }
       : resolveTaskStatus(task, counters);
-    await updateTareaVisitaRow(tareasPack.header, task, { ...resolved, updated_at: nowISO() });
+    const next = { ...task, ...resolved, updated_at: nowISO() };
+    writes.push({
+      range: `TAREAS_VISITA!A${task.rowIndex}:${headerRangeEnd(tareasPack.header.length)}${task.rowIndex}`,
+      values: [buildTareaVisitaRowFromHeader(tareasPack.header, next)],
+    });
     updated.push({ ...task, ...resolved });
   }
+
+  if (writes.length) await batchUpdateSheetValues(writes);
   return updated;
 }
 
@@ -3093,9 +3175,10 @@ async function rerunEvidencePlusForGroup(visitaId, marcaId, tipoEvidencia, fase)
     upper(item.fase || "NA") === upper(fase || "NA")
   );
 
-  for (const item of group) {
+  const prepared = group.map((item) => {
     const analysis = computeEvidencePlusAnalysis(item, { visit, sameVisit: evidences, reglas });
-    await updateEvidenceRow(header, item, {
+    const next = {
+      ...item,
       resultado_ai: analysis.resultado_ai,
       score_confianza: String(analysis.score_confianza),
       riesgo: analysis.riesgo,
@@ -3106,8 +3189,30 @@ async function rerunEvidencePlusForGroup(visitaId, marcaId, tipoEvidencia, fase)
       hash_foto: analysis.hash_foto,
       requiere_revision_supervisor: analysis.requiere_revision_supervisor,
       status: analysis.status,
-    });
-    await maybeCreateEvidencePlusAlert({ ...item, hash_foto: analysis.hash_foto }, analysis, visit);
+      url_foto: item.url_foto,
+      note: item.note,
+    };
+    return {
+      item,
+      analysis,
+      range: `EVIDENCIAS!A${item.rowIndex}:${headerRangeEnd(header.length)}${item.rowIndex}`,
+      row: buildEvidenceRowFromHeader(header, next),
+    };
+  });
+
+  if (prepared.length) {
+    await batchUpdateSheetValues(prepared.map((entry) => ({
+      range: entry.range,
+      values: [entry.row],
+    })));
+  }
+
+  for (const entry of prepared) {
+    await maybeCreateEvidencePlusAlert(
+      { ...entry.item, hash_foto: entry.analysis.hash_foto },
+      entry.analysis,
+      visit,
+    );
   }
 }
 
@@ -3725,6 +3830,10 @@ app.get("/health", async (_req, res) => {
     e028_supervisor_thumb_height: E028_SUPERVISOR_THUMB_HEIGHT,
     e028_supervisor_review_width: E028_SUPERVISOR_REVIEW_WIDTH,
     e028_legacy_photo_on_demand: true,
+    e028_fix1_sheets_write_backoff: true,
+    e028_fix1_batch_evidence_analysis: true,
+    e028_fix1_batch_task_recalculation: true,
+    e028_fix1_write_retry_attempts: SHEETS_WRITE_RETRY_ATTEMPTS,
     demo_inline_fallback_enabled: PHOTO_STORAGE_PROVIDER_NORMALIZED !== "CLOUDINARY",
     rezgo_e014_flexible_evidence_types: true,
     image_viewer_escape_enabled: true,
