@@ -1,3 +1,4 @@
+// E028_FIX2_REVISION_CONTINUA: guarda revisiones del supervisor por lotes, sin detener el avance entre fotos.
 // E028_FIX1_CUOTA_SHEETS: agrupa escrituras, reintenta límites temporales y evita mensajes técnicos al promotor.
 // E028_SUPERVISOR_CARGA_PROGRESIVA: lista liviana, miniaturas Cloudinary y foto histórica bajo demanda.
 // E027_FIX4_PREDEPLOY: preserva metadatos al revisar y expone diagnóstico /health.
@@ -51,7 +52,7 @@ app.use(bodyParser.urlencoded({ extended: false, limit: "35mb" }));
 
 const TELEGRAM_API = TELEGRAM_BOT_TOKEN ? `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}` : "";
 const EVPLUS_VERSION = "EVPLUS_V1";
-const PROMOBOLSILLO_DEPLOY_VERSION = "E028_FIX1_CUOTA_SHEETS";
+const PROMOBOLSILLO_DEPLOY_VERSION = "E028_FIX2_REVISION_CONTINUA";
 const EVPLUS_MIN_DIMENSION = 420;
 const EVPLUS_MIN_ESTIMATED_BYTES = 9000;
 const PHOTO_CELL_LIMIT = 48000;
@@ -83,6 +84,7 @@ const E028_SUPERVISOR_THUMB_HEIGHT = 220;
 const E028_SUPERVISOR_REVIEW_WIDTH = 1280;
 const SHEETS_WRITE_RETRY_ATTEMPTS = 6;
 const SHEETS_WRITE_MAX_BACKOFF_MS = 32000;
+const E028_REVIEW_BATCH_MAX = 100;
 const pendingEvidenceAnalysisTimers = new Map();
 const pendingVisitTaskRecalcTimers = new Map();
 const SHEET_READ_CACHE_DEFAULT_TTL_MS = 45000;
@@ -3834,6 +3836,10 @@ app.get("/health", async (_req, res) => {
     e028_fix1_batch_evidence_analysis: true,
     e028_fix1_batch_task_recalculation: true,
     e028_fix1_write_retry_attempts: SHEETS_WRITE_RETRY_ATTEMPTS,
+    e028_fix2_continuous_review: true,
+    e028_fix2_review_batch_endpoint: true,
+    e028_fix2_review_batch_max: E028_REVIEW_BATCH_MAX,
+    e028_fix2_review_undo_supported: true,
     demo_inline_fallback_enabled: PHOTO_STORAGE_PROVIDER_NORMALIZED !== "CLOUDINARY",
     rezgo_e014_flexible_evidence_types: true,
     image_viewer_escape_enabled: true,
@@ -5083,6 +5089,171 @@ app.post("/miniapp/supervisor/evidence-photo", async (req, res) => {
     });
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message || "supervisor evidence photo error" });
+  }
+});
+
+
+app.post("/miniapp/supervisor/evidence-review-batch", async (req, res) => {
+  try {
+    const { actor } = await getActorFromRequest(req);
+    if (actor.role !== "supervisor") {
+      return res.status(403).json({ ok: false, error: "Solo supervisor" });
+    }
+
+    const incoming = Array.isArray(req.body?.reviews) ? req.body.reviews : [];
+    if (!incoming.length) {
+      return res.status(400).json({ ok: false, error: "No se recibieron revisiones" });
+    }
+    if (incoming.length > E028_REVIEW_BATCH_MAX) {
+      return res.status(400).json({
+        ok: false,
+        error: `Máximo ${E028_REVIEW_BATCH_MAX} revisiones por envío`,
+      });
+    }
+
+    const team = await getPromotoresDeSupervisor(actor.profile.external_id);
+    const promotorIds = new Set(team.map((item) => item.promotor_id));
+    const evidences = await getEvidenciasAll();
+    const evidenceMap = buildEvidenceMapById(evidences);
+    const visitMap = await getAllVisitsMap();
+    const header = await getEvidenciasHeader();
+    const reviewedBy = actor.profile.nombre || actor.profile.supervisor_id;
+    const reviewedAt = nowISO();
+
+    const prepared = [];
+    const results = [];
+    const seen = new Set();
+
+    for (const review of incoming) {
+      const clientReviewId = norm(review?.client_review_id);
+      const evidenciaId = norm(review?.evidencia_id);
+      if (!evidenciaId) {
+        results.push({
+          ok: false,
+          client_review_id: clientReviewId,
+          evidencia_id: "",
+          error: "Falta evidencia_id",
+        });
+        continue;
+      }
+
+      const dedupeKey = clientReviewId || evidenciaId;
+      if (seen.has(dedupeKey)) {
+        results.push({
+          ok: true,
+          client_review_id: clientReviewId,
+          evidencia_id: evidenciaId,
+          duplicate_ignored: true,
+        });
+        continue;
+      }
+      seen.add(dedupeKey);
+
+      const evidence = evidenceMap[evidenciaId];
+      if (!evidence) {
+        results.push({
+          ok: false,
+          client_review_id: clientReviewId,
+          evidencia_id: evidenciaId,
+          error: "Evidencia no encontrada",
+        });
+        continue;
+      }
+
+      const visit = visitMap[evidence.visita_id];
+      if (!visit || !promotorIds.has(visit.promotor_id)) {
+        results.push({
+          ok: false,
+          client_review_id: clientReviewId,
+          evidencia_id: evidenciaId,
+          error: "No autorizada",
+        });
+        continue;
+      }
+
+      const restore = review?.restore === true;
+      let patch;
+
+      if (restore) {
+        patch = {
+          decision_supervisor: upper(review?.previous_decision_supervisor),
+          motivo_revision: norm(review?.previous_motivo_revision),
+          revisado_por: norm(review?.previous_revisado_por),
+          fecha_revision: norm(review?.previous_fecha_revision),
+          requiere_revision_supervisor: norm(review?.previous_requiere_revision_supervisor || "TRUE"),
+          status: upper(review?.previous_status || "PENDIENTE_REVISION"),
+        };
+      } else {
+        const decision = upper(review?.decision_supervisor);
+        const motivo = norm(review?.motivo_revision);
+        if (!["APROBADA", "OBSERVADA", "RECHAZADA"].includes(decision)) {
+          results.push({
+            ok: false,
+            client_review_id: clientReviewId,
+            evidencia_id: evidenciaId,
+            error: "Decisión no válida",
+          });
+          continue;
+        }
+        if (["OBSERVADA", "RECHAZADA"].includes(decision) && !motivo) {
+          results.push({
+            ok: false,
+            client_review_id: clientReviewId,
+            evidencia_id: evidenciaId,
+            error: decision === "OBSERVADA"
+              ? "Comentario requerido"
+              : "Motivo de rechazo requerido",
+          });
+          continue;
+        }
+        patch = {
+          decision_supervisor: decision,
+          motivo_revision: motivo,
+          revisado_por: reviewedBy,
+          fecha_revision: reviewedAt,
+          requiere_revision_supervisor: decision === "APROBADA" ? "FALSE" : "TRUE",
+          status: decision,
+        };
+      }
+
+      const next = {
+        ...evidence,
+        ...patch,
+        url_foto: evidence.url_foto,
+        note: evidence.note,
+      };
+
+      prepared.push({
+        range: `EVIDENCIAS!A${evidence.rowIndex}:${headerRangeEnd(header.length)}${evidence.rowIndex}`,
+        values: [buildEvidenceRowFromHeader(header, next)],
+      });
+
+      results.push({
+        ok: true,
+        client_review_id: clientReviewId,
+        evidencia_id: evidenciaId,
+        decision_supervisor: patch.decision_supervisor,
+        status: patch.status,
+        restored: restore,
+      });
+    }
+
+    if (prepared.length) {
+      await batchUpdateSheetValues(prepared);
+    }
+
+    return res.json({
+      ok: true,
+      accepted: prepared.length,
+      rejected: results.filter((item) => !item.ok).length,
+      results,
+    });
+  } catch (error) {
+    const friendly = buildFriendlySheetsError(error, "supervisor-evidence-review-batch");
+    return res.status(friendly?.statusCode || 500).json({
+      ok: false,
+      error: friendly?.message || "No se pudieron sincronizar las revisiones",
+    });
   }
 });
 
