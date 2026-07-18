@@ -1,4 +1,4 @@
-// E029_INTEGRIDAD_CAPTURA: IDs deterministas, Cloudinary idempotente, confirmación real en EVIDENCIAS y recuperación de asistencia incompleta.
+// E030_VISTA_CLIENTE_OPERATIVA: acceso por empresa, evidencias aprobadas, seguimiento del cliente y avisos al supervisor. // E029_INTEGRIDAD_CAPTURA: IDs deterministas, Cloudinary idempotente, confirmación real en EVIDENCIAS y recuperación de asistencia incompleta.
 // E028_FIX2_REVISION_CONTINUA: guarda revisiones del supervisor por lotes, sin detener el avance entre fotos.
 // E028_FIX1_CUOTA_SHEETS: agrupa escrituras, reintenta límites temporales y evita mensajes técnicos al promotor.
 // E028_SUPERVISOR_CARGA_PROGRESIVA: lista liviana, miniaturas Cloudinary y foto histórica bajo demanda.
@@ -53,12 +53,41 @@ app.use(bodyParser.urlencoded({ extended: false, limit: "35mb" }));
 
 const TELEGRAM_API = TELEGRAM_BOT_TOKEN ? `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}` : "";
 const EVPLUS_VERSION = "EVPLUS_V1";
-const PROMOBOLSILLO_DEPLOY_VERSION = "E029_INTEGRIDAD_CAPTURA_CLOUDINARY_SHEETS";
+const PROMOBOLSILLO_DEPLOY_VERSION = "E030_VISTA_CLIENTE_OPERATIVA";
 const EVPLUS_MIN_DIMENSION = 420;
 const EVPLUS_MIN_ESTIMATED_BYTES = 9000;
 const PHOTO_CELL_LIMIT = 48000;
 const MARCAS_FUERA_SERVICIO_SHEET = "MARCAS_FUERA_SERVICIO";
 const EXTERNAL_CAMERA_TOKEN_TTL_MS = 3 * 60 * 60 * 1000;
+
+const CLIENT_REQUESTS_SHEET = "SOLICITUDES_CLIENTE";
+const CLIENT_REQUESTS_HEADER = [
+  "solicitud_id",
+  "fecha_hora",
+  "cliente_id",
+  "external_id",
+  "nombre_contacto",
+  "tipo_accion",
+  "entidad_tipo",
+  "entidad_id",
+  "visita_id",
+  "promotor_id",
+  "evidencia_id",
+  "alerta_origen_id",
+  "tienda_id",
+  "marca_id",
+  "titulo",
+  "comentario",
+  "estatus",
+  "supervisor_external_id",
+  "alerta_seguimiento_id",
+  "notificacion_status",
+  "atendida_por",
+  "fecha_atencion",
+  "respuesta",
+  "updated_at",
+];
+const CLIENT_REQUEST_ACTIONS = new Set(["ENTERADO", "SOLICITAR_SEGUIMIENTO", "PEDIR_EVIDENCIA_ADICIONAL"]);
 
 const MARCAS_FUERA_SERVICIO_HEADER = [
   "registro_id",
@@ -90,6 +119,10 @@ const E029_EVIDENCE_VERIFY_ATTEMPTS = 6;
 const E029_EVIDENCE_VERIFY_BASE_DELAY_MS = 650;
 const E029_CLOUDINARY_UPLOAD_CONCURRENCY = 3;
 let evidenceSheetWriteTail = Promise.resolve();
+let clientRequestsSheetReady = false;
+let clientRequestsSheetReadyPromise = null;
+let marcasFueraServicioSheetReady = false;
+let marcasFueraServicioSheetReadyPromise = null;
 const pendingEvidenceAnalysisTimers = new Map();
 const pendingVisitTaskRecalcTimers = new Map();
 const SHEET_READ_CACHE_DEFAULT_TTL_MS = 45000;
@@ -853,7 +886,7 @@ function sheetNameFromRange(range = "") {
 
 function getSheetCacheTtlMs(range = "") {
   const sheetName = sheetNameFromRange(range);
-  if (["SESIONES", "VISITAS", "EVIDENCIAS", "ALERTAS"].includes(sheetName)) return SHEET_READ_CACHE_FAST_TTL_MS;
+  if (["SESIONES", "VISITAS", "EVIDENCIAS", "ALERTAS", "SOLICITUDES_CLIENTE"].includes(sheetName)) return SHEET_READ_CACHE_FAST_TTL_MS;
   if (["PROMOTORES", "SUPERVISORES", "ACCESOS_CLIENTE", "CLIENTES", "TIENDAS", "MARCAS", "TIPOS_EVIDENCIA", "REGLAS_EVIDENCIA", "TIENDA_MARCAS"].includes(sheetName)) {
     return SHEET_READ_CACHE_SLOW_TTL_MS;
   }
@@ -1583,6 +1616,7 @@ function parseAlertRow(row, idx, header) {
     fecha_hora: norm(row[map.fecha_hora]),
     promotor_id: norm(row[map.promotor_id]),
     visita_id: norm(row[map.visita_id]),
+    promotor_id: norm(row[map.promotor_id]),
     evidencia_id: norm(row[map.evidencia_id]),
     tipo_alerta: norm(row[map.tipo_alerta]),
     severidad: upper(row[map.severidad] || "MEDIA"),
@@ -2591,7 +2625,18 @@ async function getTiendaMarcasActivasByTiendaId(tiendaId) {
 }
 
 async function ensureMarcasFueraServicioSheet() {
-  await ensureSheetWithHeader(MARCAS_FUERA_SERVICIO_SHEET, MARCAS_FUERA_SERVICIO_HEADER);
+  if (marcasFueraServicioSheetReady) return;
+  if (!marcasFueraServicioSheetReadyPromise) {
+    marcasFueraServicioSheetReadyPromise = (async () => {
+      await ensureSheetWithHeader(MARCAS_FUERA_SERVICIO_SHEET, MARCAS_FUERA_SERVICIO_HEADER);
+      marcasFueraServicioSheetReady = true;
+    })();
+  }
+  try {
+    await marcasFueraServicioSheetReadyPromise;
+  } finally {
+    marcasFueraServicioSheetReadyPromise = null;
+  }
 }
 
 function parseMarcaFueraServicioRow(row, idx, header) {
@@ -3758,7 +3803,7 @@ async function getClientScopeFromRequest(req) {
   const { validated } = await getActorFromRequest(req);
   const ctx = await getClienteContextByExternalId(validated.external_id);
   if (!ctx) throw new Error("Solo cliente");
-  return ctx;
+  return { ...ctx, validated };
 }
 
 async function getClientBrandIds(clienteId) {
@@ -3783,14 +3828,26 @@ async function getClientDataset(clienteId, filters = {}) {
 
   let evidences = (await getEvidenciasAll()).filter((item) =>
     upper(item.tipo_evidencia) !== "ASISTENCIA" &&
+    upper(item.status) !== "ANULADA" &&
+    upper(item.decision_supervisor || item.status) === "APROBADA" &&
     clientBrandIds.has(item.marca_id) &&
     inRangeYmd(item.fecha_hora, fecha_inicio, fecha_fin)
   );
   if (marcaId) evidences = evidences.filter((item) => item.marca_id === marcaId);
 
-  let visits = Object.values(visitMap).filter((visit) =>
-    evidences.some((e) => e.visita_id === visit.visita_id)
+  const outOfServicePack = await getMarcasFueraServicioRowsAll();
+  let outOfService = outOfServicePack.rows.filter((item) =>
+    upper(item.estatus || "ACTIVA") === "ACTIVA" &&
+    clientBrandIds.has(item.marca_id) &&
+    inRangeYmd(item.fecha_hora, fecha_inicio, fecha_fin) &&
+    (!marcaId || item.marca_id === marcaId)
   );
+
+  const visitIdsWithClientActivity = new Set([
+    ...evidences.map((item) => item.visita_id),
+    ...outOfService.map((item) => item.visita_id),
+  ].filter(Boolean));
+  let visits = Object.values(visitMap).filter((visit) => visitIdsWithClientActivity.has(visit.visita_id));
 
   let stores = unique(visits.map((visit) => visit.tienda_id)).map((id) => tiendaMap[id]).filter(Boolean);
   if (cadena) stores = stores.filter((store) => norm(store.cadena) === cadena);
@@ -3800,9 +3857,11 @@ async function getClientDataset(clienteId, filters = {}) {
   visits = visits.filter((visit) => scopedStoreIds.has(visit.tienda_id));
   const scopedVisitIds = new Set(visits.map((visit) => visit.visita_id));
   evidences = evidences.filter((item) => scopedVisitIds.has(item.visita_id));
+  outOfService = outOfService.filter((item) => scopedVisitIds.has(item.visita_id) && scopedStoreIds.has(item.tienda_id));
   const scopedEvidenceIds = new Set(evidences.map((item) => item.evidencia_id));
 
   const alerts = (await getAlertsAll()).filter((alert) =>
+    !upper(alert.tipo_alerta).startsWith("SOLICITUD_CLIENTE_") &&
     inRangeYmd(alert.fecha_hora, fecha_inicio, fecha_fin) &&
     ((alert.evidencia_id && scopedEvidenceIds.has(alert.evidencia_id)) || (alert.visita_id && scopedVisitIds.has(alert.visita_id)))
   );
@@ -3815,10 +3874,34 @@ async function getClientDataset(clienteId, filters = {}) {
     visits,
     evidences,
     alerts,
+    outOfService,
     visitMap,
     promotorMap,
     marcaMap,
     tiendaMap,
+  };
+}
+
+function buildClientOutOfServiceIncident(item, data) {
+  return {
+    alerta_id: `MFS:${item.registro_id}`,
+    fecha_hora: item.fecha_hora,
+    fecha_hora_fmt: fmtDateTimeTZ(item.fecha_hora),
+    promotor_id: item.promotor_id || "",
+    promotor_nombre: data.promotorMap[item.promotor_id]?.nombre || item.promotor_id || "",
+    visita_id: item.visita_id || "",
+    evidencia_id: "",
+    tipo_alerta: "MARCA_SIN_SERVICIO",
+    severidad: "MEDIA",
+    descripcion: [data.marcaMap[item.marca_id]?.marca_nombre || item.marca_id, item.motivo, item.comentario].filter(Boolean).join(" · "),
+    status: upper(item.estatus || "ACTIVA") === "ACTIVA" ? "ABIERTA" : upper(item.estatus),
+    supervisor_id: data.promotorMap[item.promotor_id]?.supervisor_external_id || "",
+    tienda_id: item.tienda_id || "",
+    tienda_nombre: data.tiendaMap[item.tienda_id]?.nombre_tienda || item.tienda_id || "",
+    cadena: data.tiendaMap[item.tienda_id]?.cadena || "",
+    region: data.tiendaMap[item.tienda_id]?.region || "",
+    marca_id: item.marca_id || "",
+    marca_nombre: data.marcaMap[item.marca_id]?.marca_nombre || item.marca_id || "",
   };
 }
 
@@ -3832,6 +3915,217 @@ function paginateRows(rows, pagination = {}) {
     rows: rows.slice(start, start + pageSize),
     meta: { page, page_size: pageSize, total_rows: totalRows, total_pages: totalPages },
   };
+}
+
+
+function clientRequestActionLabel(value = "") {
+  const action = upper(value);
+  if (action === "ENTERADO") return "Enterado";
+  if (action === "PEDIR_EVIDENCIA_ADICIONAL") return "Pedir evidencia adicional";
+  return "Solicitar seguimiento";
+}
+
+function parseClientRequestRow(row, idx, header) {
+  const map = headerIndexMap(header);
+  return {
+    rowIndex: idx + 2,
+    solicitud_id: norm(row[map.solicitud_id]),
+    fecha_hora: norm(row[map.fecha_hora]),
+    cliente_id: norm(row[map.cliente_id]),
+    external_id: norm(row[map.external_id]),
+    nombre_contacto: norm(row[map.nombre_contacto]),
+    tipo_accion: upper(row[map.tipo_accion]),
+    entidad_tipo: upper(row[map.entidad_tipo]),
+    entidad_id: norm(row[map.entidad_id]),
+    visita_id: norm(row[map.visita_id]),
+    evidencia_id: norm(row[map.evidencia_id]),
+    alerta_origen_id: norm(row[map.alerta_origen_id]),
+    tienda_id: norm(row[map.tienda_id]),
+    marca_id: norm(row[map.marca_id]),
+    titulo: norm(row[map.titulo]),
+    comentario: norm(row[map.comentario]),
+    estatus: upper(row[map.estatus] || "ABIERTA"),
+    supervisor_external_id: norm(row[map.supervisor_external_id]),
+    alerta_seguimiento_id: norm(row[map.alerta_seguimiento_id]),
+    notificacion_status: upper(row[map.notificacion_status] || ""),
+    atendida_por: norm(row[map.atendida_por]),
+    fecha_atencion: norm(row[map.fecha_atencion]),
+    respuesta: norm(row[map.respuesta]),
+    updated_at: norm(row[map.updated_at]),
+  };
+}
+
+function buildClientRequestRow(header, payload = {}) {
+  const row = new Array(header.length).fill("");
+  header.forEach((name, idx) => {
+    if (Object.prototype.hasOwnProperty.call(payload, name)) row[idx] = payload[name] ?? "";
+  });
+  return row;
+}
+
+async function ensureClientRequestsSheet() {
+  if (clientRequestsSheetReady) return;
+  if (!clientRequestsSheetReadyPromise) {
+    clientRequestsSheetReadyPromise = (async () => {
+      await ensureSheetWithHeader(CLIENT_REQUESTS_SHEET, CLIENT_REQUESTS_HEADER);
+      clientRequestsSheetReady = true;
+    })();
+  }
+  try {
+    await clientRequestsSheetReadyPromise;
+  } finally {
+    clientRequestsSheetReadyPromise = null;
+  }
+}
+
+async function getClientRequestsAll() {
+  await ensureClientRequestsSheet();
+  const header = await getSheetHeader(CLIENT_REQUESTS_SHEET);
+  const rows = await getSheetValues(`${CLIENT_REQUESTS_SHEET}!A2:${headerRangeEnd(header.length)}`, { useCache: false });
+  return { header, rows: rows.map((row, idx) => parseClientRequestRow(row, idx, header)) };
+}
+
+async function updateClientRequestRow(header, current, patch = {}) {
+  const payload = { ...current, ...patch, updated_at: patch.updated_at || nowISO() };
+  const row = buildClientRequestRow(header, payload);
+  await updateSheetValues(`${CLIENT_REQUESTS_SHEET}!A${current.rowIndex}:${headerRangeEnd(header.length)}${current.rowIndex}`, [row]);
+  return payload;
+}
+
+async function syncClientRequestFromAlertClose(alertaId, actor, status, comentario = "") {
+  if (!norm(alertaId).startsWith("ALT-CLI-")) return false;
+  const pack = await getClientRequestsAll();
+  const current = pack.rows.find((item) => item.alerta_seguimiento_id === alertaId);
+  if (!current) return false;
+  const responseText = comentario || (status === "RESUELTA" ? "Atendida por supervisión." : "Seguimiento cerrado por supervisión.");
+  await updateClientRequestRow(pack.header, current, {
+    estatus: status === "RESUELTA" ? "ATENDIDA" : "CERRADA",
+    atendida_por: actor?.profile?.nombre || actor?.profile?.supervisor_id || "Supervisor",
+    fecha_atencion: nowISO(),
+    respuesta: responseText,
+  });
+  try {
+    const chatId = await getChatIdByExternalId(current.external_id);
+    if (chatId && TELEGRAM_API) {
+      await sendTelegramText(chatId, [
+        "✅ *Seguimiento actualizado*",
+        "",
+        current.titulo ? `Contexto: *${current.titulo}*` : "",
+        `Estado: *${status === "RESUELTA" ? "ATENDIDA" : "CERRADA"}*`,
+        `Respuesta: ${responseText}`,
+      ].filter(Boolean).join("\n"), { inline_keyboard: [[{ text: "Abrir Promobolsillo", web_app: { url: getMiniAppUrl() } }]] });
+    }
+  } catch (notificationError) {
+    console.warn("syncClientRequestFromAlertClose notification error", notificationError?.message || notificationError);
+  }
+  return true;
+}
+
+async function resolveClientRequestTarget(clienteId, entityType, entityId) {
+  const type = upper(entityType);
+  const id = norm(entityId);
+  if (!id || !["EVIDENCIA", "INCIDENCIA"].includes(type)) throw new Error("Destino de solicitud no válido.");
+  const brandIds = new Set(await getClientBrandIds(clienteId));
+  const visitMap = await getAllVisitsMap();
+  const promotorMap = await getPromotorMap();
+  const tiendaMap = await getTiendaMap();
+  const marcaMap = await getMarcaMap();
+
+  if (type === "EVIDENCIA") {
+    const found = await getEvidenceById(id);
+    const evidence = found?.evidence;
+    if (!evidence || !brandIds.has(evidence.marca_id)) throw new Error("Evidencia fuera del alcance del cliente.");
+    if (upper(evidence.decision_supervisor || evidence.status) !== "APROBADA") throw new Error("La evidencia todavía no está publicada para el cliente.");
+    const visit = visitMap[evidence.visita_id] || null;
+    const promotor = visit ? promotorMap[visit.promotor_id] : null;
+    return {
+      entidad_tipo: type,
+      entidad_id: id,
+      visita_id: evidence.visita_id || "",
+      promotor_id: visit?.promotor_id || "",
+      evidencia_id: evidence.evidencia_id || id,
+      alerta_origen_id: "",
+      tienda_id: visit?.tienda_id || "",
+      marca_id: evidence.marca_id || "",
+      supervisor_external_id: promotor?.supervisor_external_id || "",
+      titulo: `${marcaMap[evidence.marca_id]?.marca_nombre || evidence.marca_id || "Marca"} · ${getStoreDisplayNameById(visit?.tienda_id, tiendaMap) || visit?.tienda_id || "Tienda"}`,
+    };
+  }
+
+  if (id.startsWith("MFS:")) {
+    const registroId = id.slice(4);
+    const outPack = await getMarcasFueraServicioRowsAll();
+    const item = outPack.rows.find((row) => row.registro_id === registroId);
+    if (!item || !brandIds.has(item.marca_id)) throw new Error("Incidencia fuera del alcance del cliente.");
+    const visit = item.visita_id ? visitMap[item.visita_id] : null;
+    const promotor = visit ? promotorMap[visit.promotor_id] : promotorMap[item.promotor_id];
+    return {
+      entidad_tipo: type,
+      entidad_id: id,
+      visita_id: item.visita_id || "",
+      promotor_id: visit?.promotor_id || item.promotor_id || "",
+      evidencia_id: "",
+      alerta_origen_id: id,
+      tienda_id: item.tienda_id || visit?.tienda_id || "",
+      marca_id: item.marca_id || "",
+      supervisor_external_id: promotor?.supervisor_external_id || "",
+      titulo: `Marca sin servicio · ${getStoreDisplayNameById(item.tienda_id || visit?.tienda_id, tiendaMap) || item.tienda_id || "Tienda"}`,
+    };
+  }
+
+  const found = await getAlertById(id);
+  const alert = found?.alert;
+  if (!alert) throw new Error("Incidencia no encontrada.");
+  const visit = alert.visita_id ? visitMap[alert.visita_id] : null;
+  let scopedBrandId = "";
+  if (alert.evidencia_id) {
+    const evidenceFound = await getEvidenceById(alert.evidencia_id);
+    if (evidenceFound?.evidence && brandIds.has(evidenceFound.evidence.marca_id)) scopedBrandId = evidenceFound.evidence.marca_id;
+  }
+  if (!scopedBrandId && visit) {
+    const visitEvidence = (await getEvidenciasAll()).find((item) => item.visita_id === visit.visita_id && brandIds.has(item.marca_id));
+    scopedBrandId = visitEvidence?.marca_id || "";
+  }
+  if (!scopedBrandId) throw new Error("Incidencia fuera del alcance del cliente.");
+  const promotor = visit ? promotorMap[visit.promotor_id] : null;
+  return {
+    entidad_tipo: type,
+    entidad_id: id,
+    visita_id: alert.visita_id || "",
+    promotor_id: alert.promotor_id || visit?.promotor_id || "",
+    evidencia_id: alert.evidencia_id || "",
+    alerta_origen_id: alert.alerta_id || id,
+    tienda_id: alert.tienda_id || visit?.tienda_id || "",
+    marca_id: scopedBrandId,
+    supervisor_external_id: alert.supervisor_id || promotor?.supervisor_external_id || "",
+    titulo: `${alert.tipo_alerta || "Incidencia"} · ${getStoreDisplayNameById(alert.tienda_id || visit?.tienda_id, tiendaMap) || alert.tienda_id || "Tienda"}`,
+  };
+}
+
+async function createSupervisorAlertFromClientRequest(request) {
+  if (request.tipo_accion === "ENTERADO") return { created: false, status: "NO_REQUERIDA", alerta_id: "" };
+  const alertaId = `ALT-CLI-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const description = [
+    `Cliente: ${request.nombre_contacto || request.cliente_id}`,
+    `Acción: ${clientRequestActionLabel(request.tipo_accion)}`,
+    request.titulo ? `Contexto: ${request.titulo}` : "",
+    request.comentario ? `Comentario: ${request.comentario}` : "",
+  ].filter(Boolean).join(" | ");
+  const created = await createAlert({
+    alerta_id: alertaId,
+    fecha_hora: nowISO(),
+    promotor_id: request.promotor_id || "",
+    visita_id: request.visita_id || "",
+    evidencia_id: request.evidencia_id || "",
+    tipo_alerta: request.tipo_accion === "PEDIR_EVIDENCIA_ADICIONAL" ? "SOLICITUD_CLIENTE_EVIDENCIA" : "SOLICITUD_CLIENTE_SEGUIMIENTO",
+    severidad: "MEDIA",
+    descripcion: description,
+    status: "ABIERTA",
+    supervisor_id: request.supervisor_external_id || "",
+    tienda_id: request.tienda_id || "",
+    canal_notificacion: "MINIAPP_CLIENTE",
+  });
+  return { created, status: created ? "ALERTA_CREADA" : "PENDIENTE", alerta_id: created ? alertaId : "" };
 }
 
 app.post("/miniapp/cliente/bootstrap", async (req, res) => {
@@ -3886,6 +4180,8 @@ app.post("/miniapp/cliente/dashboard", async (req, res) => {
       ["OK_EN_GEOCERCA", "OK_CON_TOLERANCIA_GPS"].includes(upper(visit.resultado_geocerca_salida))
     ).length;
     const cumplimiento = data.stores.length ? Number(((uniqueStores.size / data.stores.length) * 100).toFixed(2)) : 0;
+    const requestPack = await getClientRequestsAll();
+    const solicitudesAbiertas = requestPack.rows.filter((item) => item.cliente_id === ctx.cliente.cliente_id && ["ABIERTA", "PENDIENTE"].includes(item.estatus)).length;
     return clientOk(res, {
       period: { fecha_inicio: data.fecha_inicio, fecha_fin: data.fecha_fin, label: `${data.fecha_inicio} a ${data.fecha_fin}` },
       cliente: ctx.cliente,
@@ -3896,12 +4192,13 @@ app.post("/miniapp/cliente/dashboard", async (req, res) => {
         cumplimiento_pct: cumplimiento,
         evidencias: data.evidences.length,
         aprobadas,
-        observadas,
-        rechazadas,
-        alertas: data.alerts.length,
+        observadas: 0,
+        rechazadas: 0,
+        alertas: data.alerts.length + data.outOfService.length,
+        solicitudes_abiertas: solicitudesAbiertas,
         geocerca_ok_pct: data.visits.length ? Number(((geocercaOk / data.visits.length) * 100).toFixed(2)) : 0,
       },
-      top_alerts: Array.from(data.alerts.reduce((acc, item) => {
+      top_alerts: Array.from([...data.alerts, ...data.outOfService.map((item) => ({ tipo_alerta: "MARCA_SIN_SERVICIO" }))].reduce((acc, item) => {
         acc.set(item.tipo_alerta, (acc.get(item.tipo_alerta) || 0) + 1);
         return acc;
       }, new Map()).entries()).map(([tipo_alerta, total]) => ({ tipo_alerta, total })).sort((a, b) => b.total - a.total).slice(0, 6),
@@ -3920,6 +4217,7 @@ app.post("/miniapp/cliente/stores", async (req, res) => {
       const visits = data.visits.filter((visit) => visit.tienda_id === store.tienda_id);
       const evidences = data.evidences.filter((item) => data.visitMap[item.visita_id]?.tienda_id === store.tienda_id);
       const alerts = data.alerts.filter((item) => data.visitMap[item.visita_id]?.tienda_id === store.tienda_id);
+      const outOfService = data.outOfService.filter((item) => item.tienda_id === store.tienda_id);
       const lastVisit = visits.slice().sort((a, b) => String(b.hora_inicio || b.fecha).localeCompare(String(a.hora_inicio || a.fecha)))[0] || null;
       return {
         tienda_id: store.tienda_id,
@@ -3933,8 +4231,8 @@ app.post("/miniapp/cliente/stores", async (req, res) => {
         evidencias: evidences.length,
         aprobadas: evidences.filter((item) => upper(item.decision_supervisor || item.status) === "APROBADA").length,
         observadas: evidences.filter((item) => upper(item.decision_supervisor || item.status) === "OBSERVADA").length,
-        alertas: alerts.length,
-        estatus: alerts.length ? "CON_INCIDENCIAS" : visits.length ? "CON_VISITA" : "SIN_VISITA",
+        alertas: alerts.length + outOfService.length,
+        estatus: (alerts.length + outOfService.length) ? "CON_INCIDENCIAS" : visits.length ? "CON_VISITA" : "SIN_VISITA",
       };
     }).sort((a, b) => a.tienda_nombre.localeCompare(b.tienda_nombre));
     const paged = paginateRows(rows, req.body?.pagination || {});
@@ -3954,11 +4252,14 @@ app.post("/miniapp/cliente/store-detail", async (req, res) => {
     if (!store) return clientFail(res, 404, "Tienda no encontrada");
     const visits = data.visits.filter((visit) => visit.tienda_id === tiendaId);
     const evidences = data.evidences.filter((item) => data.visitMap[item.visita_id]?.tienda_id === tiendaId).map((item) => buildEvidenceView(item, data.marcaMap, data.visitMap, data.tiendaMap, data.promotorMap));
-    const alerts = data.alerts.filter((item) => data.visitMap[item.visita_id]?.tienda_id === tiendaId).map((item) => ({
-      ...item,
-      fecha_hora_fmt: fmtDateTimeTZ(item.fecha_hora),
-      promotor_nombre: data.promotorMap[item.promotor_id]?.nombre || item.promotor_id,
-    }));
+    const alerts = [
+      ...data.alerts.filter((item) => data.visitMap[item.visita_id]?.tienda_id === tiendaId).map((item) => ({
+        ...item,
+        fecha_hora_fmt: fmtDateTimeTZ(item.fecha_hora),
+        promotor_nombre: data.promotorMap[item.promotor_id]?.nombre || item.promotor_id,
+      })),
+      ...data.outOfService.filter((item) => item.tienda_id === tiendaId).map((item) => buildClientOutOfServiceIncident(item, data)),
+    ];
     return clientOk(res, {
       store,
       summary: {
@@ -3987,8 +4288,7 @@ app.post("/miniapp/cliente/evidences", async (req, res) => {
     if (norm(filters.tipo_evidencia)) rows = rows.filter((item) => evidenceTypeKey(item.tipo_evidencia) === evidenceTypeKey(filters.tipo_evidencia));
     if (norm(filters.fase)) rows = rows.filter((item) => norm(item.fase) === norm(filters.fase));
     if (upper(filters.riesgo)) rows = rows.filter((item) => upper(item.riesgo) === upper(filters.riesgo));
-    if (upper(filters.decision_supervisor)) rows = rows.filter((item) => upper(item.decision_supervisor || item.status) === upper(filters.decision_supervisor));
-    else rows = rows.filter((item) => ["APROBADA", "OBSERVADA"].includes(upper(item.decision_supervisor || item.status)));
+    rows = rows.filter((item) => upper(item.decision_supervisor || item.status) === "APROBADA");
     rows.sort((a, b) => String(b.fecha_hora).localeCompare(String(a.fecha_hora)));
     const paged = paginateRows(rows, req.body?.pagination || { page_size: 40 });
     return clientOk(res, { rows: paged.rows }, paged.meta);
@@ -4002,14 +4302,17 @@ app.post("/miniapp/cliente/incidents", async (req, res) => {
     const ctx = await getClientScopeFromRequest(req);
     const filters = req.body?.filters || req.body || {};
     const data = await getClientDataset(ctx.cliente.cliente_id, filters);
-    let rows = data.alerts.map((item) => ({
-      ...item,
-      fecha_hora_fmt: fmtDateTimeTZ(item.fecha_hora),
-      promotor_nombre: data.promotorMap[item.promotor_id]?.nombre || item.promotor_id,
-      tienda_nombre: data.tiendaMap[item.tienda_id]?.nombre_tienda || item.tienda_id,
-      cadena: data.tiendaMap[item.tienda_id]?.cadena || "",
-      region: data.tiendaMap[item.tienda_id]?.region || "",
-    }));
+    let rows = [
+      ...data.alerts.map((item) => ({
+        ...item,
+        fecha_hora_fmt: fmtDateTimeTZ(item.fecha_hora),
+        promotor_nombre: data.promotorMap[item.promotor_id]?.nombre || item.promotor_id,
+        tienda_nombre: data.tiendaMap[item.tienda_id]?.nombre_tienda || item.tienda_id,
+        cadena: data.tiendaMap[item.tienda_id]?.cadena || "",
+        region: data.tiendaMap[item.tienda_id]?.region || "",
+      })),
+      ...data.outOfService.map((item) => buildClientOutOfServiceIncident(item, data)),
+    ];
     if (norm(filters.tipo_alerta)) rows = rows.filter((item) => item.tipo_alerta === norm(filters.tipo_alerta));
     if (upper(filters.severidad)) rows = rows.filter((item) => upper(item.severidad) === upper(filters.severidad));
     if (upper(filters.status)) rows = rows.filter((item) => upper(item.status) === upper(filters.status));
@@ -4018,6 +4321,79 @@ app.post("/miniapp/cliente/incidents", async (req, res) => {
     return clientOk(res, { rows: paged.rows }, paged.meta);
   } catch (error) {
     return clientFail(res, error.message === "Solo cliente" ? 403 : 500, error.message || "cliente incidents error");
+  }
+});
+
+
+app.post("/miniapp/cliente/requests", async (req, res) => {
+  try {
+    const ctx = await getClientScopeFromRequest(req);
+    const pack = await getClientRequestsAll();
+    let rows = pack.rows.filter((item) => item.cliente_id === ctx.cliente.cliente_id);
+    const status = upper(req.body?.status);
+    if (status) rows = rows.filter((item) => item.estatus === status);
+    rows.sort((a, b) => String(b.fecha_hora).localeCompare(String(a.fecha_hora)));
+    const paged = paginateRows(rows, req.body?.pagination || { page: 1, page_size: 100 });
+    return clientOk(res, { rows: paged.rows }, paged.meta);
+  } catch (error) {
+    return clientFail(res, error.message === "Solo cliente" ? 403 : 500, error.message || "cliente requests error");
+  }
+});
+
+app.post("/miniapp/cliente/request", async (req, res) => {
+  try {
+    const ctx = await getClientScopeFromRequest(req);
+    const tipoAccion = upper(req.body?.tipo_accion);
+    const entidadTipo = upper(req.body?.entidad_tipo);
+    const entidadId = norm(req.body?.entidad_id);
+    const comentario = fitCell(req.body?.comentario || "", 1200);
+    if (!CLIENT_REQUEST_ACTIONS.has(tipoAccion)) return clientFail(res, 400, "Acción de cliente no válida.");
+    if (tipoAccion !== "ENTERADO" && !comentario) return clientFail(res, 400, "Agrega un comentario breve para enviar la solicitud.");
+
+    const target = await resolveClientRequestTarget(ctx.cliente.cliente_id, entidadTipo, entidadId);
+    const pack = await getClientRequestsAll();
+    const duplicate = pack.rows.find((item) =>
+      item.cliente_id === ctx.cliente.cliente_id &&
+      item.external_id === ctx.validated.external_id &&
+      item.tipo_accion === tipoAccion &&
+      item.entidad_tipo === target.entidad_tipo &&
+      item.entidad_id === target.entidad_id &&
+      !["ATENDIDA", "CERRADA", "CANCELADA"].includes(item.estatus)
+    );
+    if (duplicate) return clientOk(res, { request: duplicate, deduplicated: true });
+
+    const request = {
+      solicitud_id: `SOL-CLI-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      fecha_hora: nowISO(),
+      cliente_id: ctx.cliente.cliente_id,
+      external_id: ctx.validated.external_id,
+      nombre_contacto: ctx.access.nombre_contacto || ctx.cliente.cliente_nombre || "Cliente",
+      tipo_accion: tipoAccion,
+      ...target,
+      comentario,
+      estatus: tipoAccion === "ENTERADO" ? "ENTERADO" : "ABIERTA",
+      alerta_seguimiento_id: "",
+      notificacion_status: tipoAccion === "ENTERADO" ? "NO_REQUERIDA" : "PENDIENTE",
+      atendida_por: "",
+      fecha_atencion: "",
+      respuesta: "",
+      updated_at: nowISO(),
+    };
+    await appendSheetValues(`${CLIENT_REQUESTS_SHEET}!A2:${headerRangeEnd(pack.header.length)}`, [buildClientRequestRow(pack.header, request)]);
+
+    const notification = await createSupervisorAlertFromClientRequest(request);
+    const refreshed = await getClientRequestsAll();
+    const current = refreshed.rows.find((item) => item.solicitud_id === request.solicitud_id);
+    const finalRequest = current
+      ? await updateClientRequestRow(refreshed.header, current, {
+          alerta_seguimiento_id: notification.alerta_id || "",
+          notificacion_status: notification.status,
+        })
+      : { ...request, alerta_seguimiento_id: notification.alerta_id || "", notificacion_status: notification.status };
+    return clientOk(res, { request: finalRequest, deduplicated: false });
+  } catch (error) {
+    const status = error.message === "Solo cliente" ? 403 : /fuera del alcance|no válida|todavía no está publicada|Agrega/.test(error.message || "") ? 400 : 500;
+    return clientFail(res, status, error.message || "cliente request error");
   }
 });
 
@@ -4087,6 +4463,9 @@ app.get("/health", async (_req, res) => {
     e028_fix2_review_batch_endpoint: true,
     e028_fix2_review_batch_max: E028_REVIEW_BATCH_MAX,
     e028_fix2_review_undo_supported: true,
+    e030_client_operational_view: true,
+    e030_client_requests_sheet: CLIENT_REQUESTS_SHEET,
+    e030_client_actions: Array.from(CLIENT_REQUEST_ACTIONS),
     e029_integrity_capture_enabled: true,
     e029_deterministic_evidence_ids: true,
     e029_cloudinary_idempotent_public_id: true,
@@ -5283,6 +5662,7 @@ app.post("/miniapp/supervisor/alert-close", async (req, res) => {
       resolved_classification,
       pending_notification: "FALSE",
     });
+    await syncClientRequestFromAlertClose(alertaId, actor, status, comentario);
     return res.json({ ok: true, alerta_id: alertaId, status, resolved_classification });
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message || "alert close error" });
