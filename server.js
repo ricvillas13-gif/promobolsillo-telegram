@@ -1,3 +1,4 @@
+// E029_INTEGRIDAD_CAPTURA: IDs deterministas, Cloudinary idempotente, confirmación real en EVIDENCIAS y recuperación de asistencia incompleta.
 // E028_FIX2_REVISION_CONTINUA: guarda revisiones del supervisor por lotes, sin detener el avance entre fotos.
 // E028_FIX1_CUOTA_SHEETS: agrupa escrituras, reintenta límites temporales y evita mensajes técnicos al promotor.
 // E028_SUPERVISOR_CARGA_PROGRESIVA: lista liviana, miniaturas Cloudinary y foto histórica bajo demanda.
@@ -52,7 +53,7 @@ app.use(bodyParser.urlencoded({ extended: false, limit: "35mb" }));
 
 const TELEGRAM_API = TELEGRAM_BOT_TOKEN ? `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}` : "";
 const EVPLUS_VERSION = "EVPLUS_V1";
-const PROMOBOLSILLO_DEPLOY_VERSION = "E028_FIX2_REVISION_CONTINUA";
+const PROMOBOLSILLO_DEPLOY_VERSION = "E029_INTEGRIDAD_CAPTURA_CLOUDINARY_SHEETS";
 const EVPLUS_MIN_DIMENSION = 420;
 const EVPLUS_MIN_ESTIMATED_BYTES = 9000;
 const PHOTO_CELL_LIMIT = 48000;
@@ -85,6 +86,10 @@ const E028_SUPERVISOR_REVIEW_WIDTH = 1280;
 const SHEETS_WRITE_RETRY_ATTEMPTS = 6;
 const SHEETS_WRITE_MAX_BACKOFF_MS = 32000;
 const E028_REVIEW_BATCH_MAX = 100;
+const E029_EVIDENCE_VERIFY_ATTEMPTS = 6;
+const E029_EVIDENCE_VERIFY_BASE_DELAY_MS = 650;
+const E029_CLOUDINARY_UPLOAD_CONCURRENCY = 3;
+let evidenceSheetWriteTail = Promise.resolve();
 const pendingEvidenceAnalysisTimers = new Map();
 const pendingVisitTaskRecalcTimers = new Map();
 const SHEET_READ_CACHE_DEFAULT_TTL_MS = 45000;
@@ -576,12 +581,25 @@ function buildCloudinarySignature(params = {}) {
     .join("&");
   return crypto.createHash("sha1").update(`${canonical}${CLOUDINARY_API_SECRET}`).digest("hex");
 }
-async function uploadPhotoDataUrlToCloudinary(photoValue, photoName = "") {
+function sanitizeCloudinaryStorageKey(value = "") {
+  const cleaned = norm(value)
+    .replace(/[^a-zA-Z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 120);
+  return cleaned || `evidence-${Date.now()}`;
+}
+
+async function uploadPhotoDataUrlToCloudinary(photoValue, photoName = "", storageKey = "") {
   const parsed = parseDataUrl(photoValue);
   if (!parsed) return null;
   if (!CLOUDINARY_ENABLED) throw new Error("Cloudinary no está configurado en Render.");
   const timestamp = Math.floor(Date.now() / 1000);
-  const signedParams = { timestamp };
+  const publicId = sanitizeCloudinaryStorageKey(storageKey || buildEvidencePhotoHash(photoValue, photoName).slice(0, 40));
+  const signedParams = {
+    timestamp,
+    public_id: publicId,
+    overwrite: "true",
+  };
   if (norm(CLOUDINARY_FOLDER)) signedParams.folder = norm(CLOUDINARY_FOLDER);
   const signature = buildCloudinarySignature(signedParams);
   const form = new FormData();
@@ -589,6 +607,8 @@ async function uploadPhotoDataUrlToCloudinary(photoValue, photoName = "") {
   form.append("api_key", norm(CLOUDINARY_API_KEY));
   form.append("timestamp", String(timestamp));
   form.append("signature", signature);
+  form.append("public_id", publicId);
+  form.append("overwrite", "true");
   if (signedParams.folder) form.append("folder", signedParams.folder);
   const endpoint = `https://api.cloudinary.com/v1_1/${encodeURIComponent(norm(CLOUDINARY_CLOUD_NAME))}/image/upload`;
   const response = await fetch(endpoint, { method: "POST", body: form });
@@ -608,7 +628,7 @@ async function uploadPhotoDataUrlToCloudinary(photoValue, photoName = "") {
     mime: payload.format ? `image/${norm(payload.format)}` : parsed.mime,
   };
 }
-async function materializePhotoStorage(photoValue, photoName = "", baseNote = "") {
+async function materializePhotoStorage(photoValue, photoName = "", baseNote = "", storageKey = "") {
   const originalLength = norm(photoValue).length;
   const photoMeta = getImageMeta(photoValue);
   if (norm(photoValue).startsWith("data:") && PHOTO_STORAGE_PROVIDER_NORMALIZED === "CLOUDINARY") {
@@ -616,7 +636,7 @@ async function materializePhotoStorage(photoValue, photoName = "", baseNote = ""
       throw new Error("E027: Cloudinary no está configurado. Revisa CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY y CLOUDINARY_API_SECRET en Render.");
     }
     try {
-      const upload = await uploadPhotoDataUrlToCloudinary(photoValue, photoName);
+      const upload = await uploadPhotoDataUrlToCloudinary(photoValue, photoName, storageKey);
       if (!upload?.url) throw new Error("Cloudinary no devolvió secure_url.");
       const uploadedMeta = {
         mime: upload.mime || photoMeta.mime,
@@ -683,6 +703,30 @@ function buildEvidencePhotoHash(photoValue, photoName = "") {
   const normalized = norm(photoValue);
   const digestInput = normalized.startsWith("data:") ? normalized : `${photoName}|${normalized.slice(0, 500)}`;
   return crypto.createHash("sha256").update(digestInput).digest("hex");
+}
+
+function buildStableEvidenceId({
+  visitaId = "",
+  externalId = "",
+  tipoEvento = "",
+  marcaId = "",
+  tipoEvidencia = "",
+  fase = "",
+  photoValue = "",
+  photoName = "",
+} = {}) {
+  const photoHash = buildEvidencePhotoHash(photoValue, photoName);
+  const canonical = [
+    norm(visitaId),
+    norm(externalId),
+    upper(tipoEvento),
+    upper(marcaId),
+    evidenceTypeKey(tipoEvidencia),
+    upper(fase || "NA"),
+    photoHash,
+  ].join("|");
+  const digest = crypto.createHash("sha256").update(canonical).digest("hex").slice(0, 28).toUpperCase();
+  return `EV-${digest}`;
 }
 
 function normalizeTextKey(value) {
@@ -1774,6 +1818,156 @@ async function getEvidenceById(evidenciaId) {
   return null;
 }
 
+async function getEvidenceRowsFresh() {
+  const header = await getEvidenciasHeader();
+  const rows = await getSheetValues(
+    `EVIDENCIAS!A2:${headerRangeEnd(header.length)}`,
+    { useCache: false },
+  );
+  return {
+    header,
+    evidences: rows.map((row, idx) => parseEvidenceRow(row, idx, header)),
+  };
+}
+
+async function getEvidenceByIdFresh(evidenciaId) {
+  const target = norm(evidenciaId);
+  if (!target) return null;
+  const pack = await getEvidenceRowsFresh();
+  const evidence = pack.evidences.find((item) => item.evidencia_id === target);
+  return evidence ? { header: pack.header, evidence } : null;
+}
+
+async function getEvidenceByIdsFresh(evidenciaIds = []) {
+  const targets = new Set((evidenciaIds || []).map((item) => norm(item)).filter(Boolean));
+  const found = new Map();
+  if (!targets.size) return found;
+  const pack = await getEvidenceRowsFresh();
+  for (const evidence of pack.evidences) {
+    if (targets.has(evidence.evidencia_id)) found.set(evidence.evidencia_id, evidence);
+  }
+  return found;
+}
+
+function runEvidenceSheetWriteExclusive(operation) {
+  const run = evidenceSheetWriteTail
+    .catch(() => undefined)
+    .then(operation);
+  evidenceSheetWriteTail = run.catch(() => undefined);
+  return run;
+}
+
+function isRetryableSheetsWriteError(error) {
+  if (isQuotaExceededError(error)) return true;
+  const status = Number(error?.response?.status || error?.code || 0);
+  const message = [
+    error?.message,
+    error?.response?.data?.error?.message,
+    error?.code,
+  ].filter(Boolean).join(" ").toLowerCase();
+  return [408, 429, 500, 502, 503, 504].includes(status)
+    || message.includes("timeout")
+    || message.includes("timed out")
+    || message.includes("econnreset")
+    || message.includes("socket hang up")
+    || message.includes("network");
+}
+
+async function appendEvidenceRowsVerified(header, entries = []) {
+  const deduped = [];
+  const seen = new Set();
+  for (const entry of entries || []) {
+    const evidenciaId = norm(entry?.evidenciaId);
+    if (!evidenciaId || seen.has(evidenciaId)) continue;
+    seen.add(evidenciaId);
+    deduped.push({ evidenciaId, row: entry.row });
+  }
+  if (!deduped.length) return { confirmedIds: [], appendedIds: [], existingIds: [] };
+
+  return runEvidenceSheetWriteExclusive(async () => {
+    const sheets = await getSheetsClient();
+    let pending = [...deduped];
+    const appendedIds = new Set();
+    const existingIds = new Set();
+    let lastError = null;
+
+    for (let attempt = 0; attempt < E029_EVIDENCE_VERIFY_ATTEMPTS; attempt += 1) {
+      const before = await getEvidenceByIdsFresh(pending.map((item) => item.evidenciaId));
+      pending = pending.filter((item) => {
+        if (before.has(item.evidenciaId)) {
+          existingIds.add(item.evidenciaId);
+          return false;
+        }
+        return true;
+      });
+      if (!pending.length) break;
+
+      try {
+        await sheets.spreadsheets.values.append({
+          spreadsheetId: SHEET_ID,
+          range: `EVIDENCIAS!A2:${headerRangeEnd(header.length)}`,
+          valueInputOption: "USER_ENTERED",
+          insertDataOption: "INSERT_ROWS",
+          requestBody: { values: pending.map((item) => item.row) },
+        });
+        pending.forEach((item) => appendedIds.add(item.evidenciaId));
+        lastError = null;
+      } catch (error) {
+        lastError = error;
+      }
+
+      invalidateSheetCache("EVIDENCIAS");
+      await waitForSheetsRetry(E029_EVIDENCE_VERIFY_BASE_DELAY_MS + (attempt * 250));
+
+      const after = await getEvidenceByIdsFresh(pending.map((item) => item.evidenciaId));
+      pending = pending.filter((item) => !after.has(item.evidenciaId));
+      if (!pending.length) break;
+
+      if (lastError && !isRetryableSheetsWriteError(lastError)) {
+        throw buildFriendlySheetsError(lastError, "E029_APPEND_EVIDENCIAS");
+      }
+      if (attempt < E029_EVIDENCE_VERIFY_ATTEMPTS - 1) {
+        const delayMs = Math.min(
+          E029_EVIDENCE_VERIFY_BASE_DELAY_MS * (2 ** attempt),
+          SHEETS_WRITE_MAX_BACKOFF_MS,
+        );
+        console.warn("E029 evidence append not confirmed; retrying missing rows", {
+          attempt: attempt + 1,
+          pending_ids: pending.map((item) => item.evidenciaId),
+          delay_ms: delayMs,
+        });
+        await waitForSheetsRetry(delayMs);
+      }
+    }
+
+    const finalState = await getEvidenceByIdsFresh(deduped.map((item) => item.evidenciaId));
+    const missingIds = deduped
+      .map((item) => item.evidenciaId)
+      .filter((id) => !finalState.has(id));
+    if (missingIds.length) {
+      const error = new Error(`E029: Google Sheets no confirmó ${missingIds.length} evidencia(s). La aplicación no reportará éxito hasta conservar el registro.`);
+      error.statusCode = 503;
+      error.isEvidenceConfirmationFailure = true;
+      error.missingEvidenceIds = missingIds;
+      error.cause = lastError || undefined;
+      throw error;
+    }
+
+    const confirmedIds = deduped.map((item) => item.evidenciaId);
+    console.info("E029 evidence rows confirmed", {
+      confirmed_count: confirmedIds.length,
+      appended_count: appendedIds.size,
+      existing_count: existingIds.size,
+      evidencia_ids: confirmedIds,
+    });
+    return {
+      confirmedIds,
+      appendedIds: Array.from(appendedIds),
+      existingIds: Array.from(existingIds),
+    };
+  });
+}
+
 async function getEvidenciasAll() {
   const header = await getEvidenciasHeader();
   const rows = await getSheetValues(`EVIDENCIAS!A2:${headerRangeEnd(header.length)}`);
@@ -1870,61 +2064,113 @@ async function registrarEvidencia(payload) {
 
 async function registrarEvidenciasBatch(payloads = []) {
   if (!Array.isArray(payloads) || !payloads.length) {
-    return { photoOverflow: false, maxOriginalPhotoLength: 0 };
+    return { photoOverflow: false, maxOriginalPhotoLength: 0, confirmedIds: [] };
   }
   const header = await getEvidenciasHeader();
-  const rows = [];
+  const normalizedPayloads = [];
+  const seenIds = new Set();
+  for (const payload of payloads) {
+    const evidenciaId = fitCell(payload?.evidencia_id);
+    if (!evidenciaId || seenIds.has(evidenciaId)) continue;
+    seenIds.add(evidenciaId);
+    normalizedPayloads.push({ ...payload, evidencia_id: evidenciaId });
+  }
+  if (!normalizedPayloads.length) {
+    throw new Error("E029: no se recibió evidencia_id válido para conservar las fotografías.");
+  }
+
+  const existingBefore = await getEvidenceByIdsFresh(normalizedPayloads.map((item) => item.evidencia_id));
+  const pendingPayloads = normalizedPayloads.filter((item) => !existingBefore.has(item.evidencia_id));
+  const preparedEntries = [];
   let photoOverflow = false;
   let maxOriginalPhotoLength = 0;
   let driveUploadFailed = false;
   let driveUploadError = "";
 
-  for (const payload of payloads) {
-    const photoInfo = await materializePhotoStorage(payload.url_foto, payload.foto_nombre || "evidencia.jpg", payload.note || "");
-    const safeNote = photoInfo.note;
-    photoOverflow = photoOverflow || photoInfo.overflow;
-    maxOriginalPhotoLength = Math.max(maxOriginalPhotoLength, photoInfo.originalLength || 0);
-    driveUploadFailed = driveUploadFailed || !!photoInfo.driveUploadFailed;
-    if (!driveUploadError && photoInfo.driveUploadError) driveUploadError = photoInfo.driveUploadError;
-    const rowPayload = {
-      evidencia_id: fitCell(payload.evidencia_id),
-      external_id: fitCell(payload.external_id || ""),
-      fecha_hora: fitCell(payload.fecha_hora || nowISO()),
-      tipo_evento: fitCell(payload.tipo_evento || ""),
-      origen: fitCell(payload.origen || ""),
-      jornada_id: fitCell(payload.jornada_id || ""),
-      visita_id: fitCell(payload.visita_id || ""),
-      url_foto: photoInfo.value,
-      lat: fitCell(payload.lat || ""),
-      lon: fitCell(payload.lon || ""),
-      resultado_ai: fitCell(payload.resultado_ai || ""),
-      score_confianza: fitCell(payload.score_confianza || ""),
-      riesgo: fitCell(payload.riesgo || "BAJO"),
-      marca_id: fitCell(payload.marca_id || ""),
-      producto_id: fitCell(payload.producto_id || ""),
-      tipo_evidencia: fitCell(canonicalEvidenceTypeLabel(payload.tipo_evidencia || "")),
-      descripcion: fitCell(payload.descripcion || ""),
-      status: fitCell(payload.status || "ACTIVA"),
-      note: safeNote,
-      fase: fitCell(payload.fase || ""),
-      foto_nombre: fitCell(payload.foto_nombre || ""),
-      accuracy: fitCell(payload.accuracy || ""),
-      requiere_revision_supervisor: fitCell(payload.requiere_revision_supervisor || "FALSE"),
-      revisado_por: fitCell(payload.revisado_por || ""),
-      fecha_revision: fitCell(payload.fecha_revision || ""),
-      decision_supervisor: fitCell(payload.decision_supervisor || ""),
-      motivo_revision: fitCell(payload.motivo_revision || ""),
-      hallazgos_ai: fitCell(payload.hallazgos_ai || ""),
-      reglas_disparadas: fitCell(payload.reglas_disparadas || ""),
-      analizado_at: fitCell(payload.analizado_at || ""),
-      version_motor_ai: fitCell(payload.version_motor_ai || ""),
-      hash_foto: fitCell(payload.hash_foto || ""),
-    };
-    rows.push(buildEvidenceRowFromHeader(header, rowPayload));
+  for (let offset = 0; offset < pendingPayloads.length; offset += E029_CLOUDINARY_UPLOAD_CONCURRENCY) {
+    const chunk = pendingPayloads.slice(offset, offset + E029_CLOUDINARY_UPLOAD_CONCURRENCY);
+    const chunkResults = await Promise.all(chunk.map(async (payload) => {
+      const photoInfo = await materializePhotoStorage(
+        payload.url_foto,
+        payload.foto_nombre || "evidencia.jpg",
+        payload.note || "",
+        payload.evidencia_id,
+      );
+      const rowPayload = {
+        evidencia_id: fitCell(payload.evidencia_id),
+        external_id: fitCell(payload.external_id || ""),
+        fecha_hora: fitCell(payload.fecha_hora || nowISO()),
+        tipo_evento: fitCell(payload.tipo_evento || ""),
+        origen: fitCell(payload.origen || ""),
+        jornada_id: fitCell(payload.jornada_id || ""),
+        visita_id: fitCell(payload.visita_id || ""),
+        url_foto: photoInfo.value,
+        lat: fitCell(payload.lat || ""),
+        lon: fitCell(payload.lon || ""),
+        resultado_ai: fitCell(payload.resultado_ai || ""),
+        score_confianza: fitCell(payload.score_confianza || ""),
+        riesgo: fitCell(payload.riesgo || "BAJO"),
+        marca_id: fitCell(payload.marca_id || ""),
+        producto_id: fitCell(payload.producto_id || ""),
+        tipo_evidencia: fitCell(canonicalEvidenceTypeLabel(payload.tipo_evidencia || "")),
+        descripcion: fitCell(payload.descripcion || ""),
+        status: fitCell(payload.status || "ACTIVA"),
+        note: photoInfo.note,
+        fase: fitCell(payload.fase || ""),
+        foto_nombre: fitCell(payload.foto_nombre || ""),
+        accuracy: fitCell(payload.accuracy || ""),
+        requiere_revision_supervisor: fitCell(payload.requiere_revision_supervisor || "FALSE"),
+        revisado_por: fitCell(payload.revisado_por || ""),
+        fecha_revision: fitCell(payload.fecha_revision || ""),
+        decision_supervisor: fitCell(payload.decision_supervisor || ""),
+        motivo_revision: fitCell(payload.motivo_revision || ""),
+        hallazgos_ai: fitCell(payload.hallazgos_ai || ""),
+        reglas_disparadas: fitCell(payload.reglas_disparadas || ""),
+        analizado_at: fitCell(payload.analizado_at || ""),
+        version_motor_ai: fitCell(payload.version_motor_ai || ""),
+        hash_foto: fitCell(payload.hash_foto || ""),
+      };
+      return {
+        evidenciaId: payload.evidencia_id,
+        row: buildEvidenceRowFromHeader(header, rowPayload),
+        photoInfo,
+      };
+    }));
+
+    for (const result of chunkResults) {
+      preparedEntries.push({ evidenciaId: result.evidenciaId, row: result.row });
+      photoOverflow = photoOverflow || !!result.photoInfo.overflow;
+      maxOriginalPhotoLength = Math.max(maxOriginalPhotoLength, result.photoInfo.originalLength || 0);
+      driveUploadFailed = driveUploadFailed || !!result.photoInfo.driveUploadFailed;
+      if (!driveUploadError && result.photoInfo.driveUploadError) driveUploadError = result.photoInfo.driveUploadError;
+    }
   }
 
-  await appendSheetValues(`EVIDENCIAS!A2:${headerRangeEnd(header.length)}`, rows);
-  return { photoOverflow, maxOriginalPhotoLength, driveUploadFailed, driveUploadError };
+  const writeResult = await appendEvidenceRowsVerified(header, preparedEntries);
+  const finalState = await getEvidenceByIdsFresh(normalizedPayloads.map((item) => item.evidencia_id));
+  const missingIds = normalizedPayloads
+    .map((item) => item.evidencia_id)
+    .filter((id) => !finalState.has(id));
+  if (missingIds.length) {
+    const error = new Error(`E029: no fue posible confirmar ${missingIds.length} evidencia(s) en Google Sheets.`);
+    error.statusCode = 503;
+    error.isEvidenceConfirmationFailure = true;
+    error.missingEvidenceIds = missingIds;
+    throw error;
+  }
+
+  return {
+    photoOverflow,
+    maxOriginalPhotoLength,
+    driveUploadFailed,
+    driveUploadError,
+    confirmedIds: normalizedPayloads.map((item) => item.evidencia_id),
+    existingIds: [
+      ...Array.from(existingBefore.keys()),
+      ...(writeResult?.existingIds || []),
+    ],
+    appendedIds: writeResult?.appendedIds || [],
+  };
 }
 
 async function updateEvidenceRow(header, evidence, patch = {}) {
@@ -1945,6 +2191,7 @@ async function updateEvidenceRow(header, evidence, patch = {}) {
       patch.url_foto,
       next.foto_nombre || evidence.foto_nombre || "evidencia.jpg",
       Object.prototype.hasOwnProperty.call(patch, "note") ? patch.note : evidence.note,
+      evidence.evidencia_id,
     );
     next.url_foto = photoInfo.value;
     next.note = photoInfo.note;
@@ -3840,6 +4087,12 @@ app.get("/health", async (_req, res) => {
     e028_fix2_review_batch_endpoint: true,
     e028_fix2_review_batch_max: E028_REVIEW_BATCH_MAX,
     e028_fix2_review_undo_supported: true,
+    e029_integrity_capture_enabled: true,
+    e029_deterministic_evidence_ids: true,
+    e029_cloudinary_idempotent_public_id: true,
+    e029_sheets_confirmation_required: true,
+    e029_attendance_incomplete_visit_repair: true,
+    e029_cloudinary_upload_concurrency: E029_CLOUDINARY_UPLOAD_CONCURRENCY,
     demo_inline_fallback_enabled: PHOTO_STORAGE_PROVIDER_NORMALIZED !== "CLOUDINARY",
     rezgo_e014_flexible_evidence_types: true,
     image_viewer_escape_enabled: true,
@@ -4194,13 +4447,48 @@ app.post("/miniapp/promotor/start-entry", async (req, res) => {
     if (!fotoDataUrl) return res.status(400).json({ ok: false, error: "foto requerida" });
 
     const tiendaMap = await getTiendaMap();
+    const incomingPhotoHash = buildEvidencePhotoHash(fotoDataUrl, fotoNombre);
     const existingOpenVisit = (await getOpenVisitsToday(actor.profile.promotor_id)).find((item) => item.tienda_id === tiendaId);
+    let visitId = norm(existingOpenVisit?.visita_id);
+    let reusedIncompleteVisit = false;
+
     if (existingOpenVisit) {
-      return res.status(409).json({
-        ok: false,
-        error: `Ya tienes una visita abierta en ${getStoreDisplayNameById(tiendaId, tiendaMap)}. Debes registrar salida antes de volver a abrirla.`,
-        visita_id: existingOpenVisit.visita_id,
+      const freshPack = await getEvidenceRowsFresh();
+      const existingAttendance = freshPack.evidences.find((item) =>
+        item.visita_id === visitId
+        && upper(item.tipo_evento) === "ASISTENCIA_ENTRADA"
+        && upper(item.status) !== "ANULADA"
+      );
+      if (existingAttendance) {
+        if (norm(existingAttendance.hash_foto) === incomingPhotoHash) {
+          console.info("E029 start-entry idempotent replay confirmed", {
+            visita_id: visitId,
+            evidencia_id: existingAttendance.evidencia_id,
+          });
+          return res.json({
+            ok: true,
+            visita_id: visitId,
+            tienda_id: tiendaId,
+            tienda_nombre: existingOpenVisit.tienda_nombre || tiendaId,
+            tienda_display: getStoreDisplayNameById(tiendaId, tiendaMap),
+            started_at: existingOpenVisit.hora_inicio || nowISO(),
+            idempotent_replay: true,
+            attendance_evidence_id: existingAttendance.evidencia_id,
+            plan_status: "SIN_CAMBIOS",
+          });
+        }
+        return res.status(409).json({
+          ok: false,
+          error: `Ya tienes una visita abierta en ${getStoreDisplayNameById(tiendaId, tiendaMap)}. Debes registrar salida antes de volver a abrirla.`,
+          visita_id: visitId,
+          tienda_id: tiendaId,
+        });
+      }
+      reusedIncompleteVisit = true;
+      console.warn("E029 repairing open visit without attendance", {
+        visita_id: visitId,
         tienda_id: tiendaId,
+        promotor_id: actor.profile.promotor_id,
       });
     }
 
@@ -4210,7 +4498,7 @@ app.post("/miniapp/promotor/start-entry", async (req, res) => {
         promotor_id: actor.profile.promotor_id,
         external_id: actor.profile.external_id,
         tienda_id: tiendaId,
-        visita_id: "",
+        visita_id: visitId,
         marca_id: "",
         tipo_evidencia: "ASISTENCIA",
       });
@@ -4221,8 +4509,19 @@ app.post("/miniapp/promotor/start-entry", async (req, res) => {
 
     const geofence = await buildGeofenceContext(tiendaId, lat, lon, accuracy);
     const planRow = await findPlaneacionForVisit(todayISO(), actor.profile.promotor_id, tiendaId);
-    const visitId = await createVisitWithGeofence(actor.profile.promotor_id, tiendaId, "Registro de entrada", geofence);
-    const evidenceId = `EV-${Date.now()}-ASIS-IN`;
+    if (!visitId) {
+      visitId = await createVisitWithGeofence(actor.profile.promotor_id, tiendaId, "Registro de entrada", geofence);
+    }
+    const evidenceId = buildStableEvidenceId({
+      visitaId: visitId,
+      externalId: actor.profile.external_id,
+      tipoEvento: "ASISTENCIA_ENTRADA",
+      marcaId: "",
+      tipoEvidencia: "ASISTENCIA",
+      fase: "NA",
+      photoValue: fotoDataUrl,
+      photoName: fotoNombre,
+    });
     const attendanceResult = await registrarEvidencia({
       evidencia_id: evidenceId,
       external_id: actor.profile.external_id,
@@ -4250,7 +4549,7 @@ app.post("/miniapp/promotor/start-entry", async (req, res) => {
       reglas_disparadas: "",
       analizado_at: "",
       version_motor_ai: "",
-      hash_foto: buildEvidencePhotoHash(fotoDataUrl, fotoNombre),
+      hash_foto: incomingPhotoHash,
     });
     if (planRow && isVisitValidForPlan({ resultado_geocerca_entrada: geofence.resultado })) {
       const planeacionHeader = await getPlaneacionHeader();
@@ -4269,14 +4568,17 @@ app.post("/miniapp/promotor/start-entry", async (req, res) => {
       tienda_id: tiendaId,
       tienda_nombre: geofence.tienda?.nombre_tienda || tiendaId,
       tienda_display: getStoreDisplayNameById(tiendaId, tiendaMap),
-      started_at: nowISO(),
+      started_at: existingOpenVisit?.hora_inicio || nowISO(),
+      attendance_evidence_id: evidenceId,
+      repaired_incomplete_visit: reusedIncompleteVisit,
       warning: attendanceResult.driveUploadFailed ? "drive_upload_failed" : (attendanceResult.photoOverflow ? "attendance_photo_too_large_for_sheets" : undefined),
       drive_error: attendanceResult.driveUploadFailed ? attendanceResult.driveUploadError : undefined,
       plan_status: planRow ? (isVisitValidForPlan({ resultado_geocerca_entrada: geofence.resultado }) ? "VISITADA" : "PLANEADA") : "SIN_PLANEACION",
     });
   } catch (error) {
     console.error("start-entry error", error);
-    return res.status(500).json({ ok: false, error: error.message || "No se pudo registrar la entrada real." });
+    const statusCode = error?.isQuotaExceeded || error?.isEvidenceConfirmationFailure ? 503 : 500;
+    return res.status(statusCode).json({ ok: false, error: error.message || "No se pudo registrar la entrada real." });
   }
 });
 
@@ -4418,10 +4720,19 @@ app.post("/miniapp/promotor/evidence-register", async (req, res) => {
 
     const created = [];
     const batchPayloads = fotos.map((photo) => {
-      const evidenceId = `EV-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-      created.push(evidenceId);
       const photoName = fitCell(norm(photo?.name || "evidencia.jpg"));
       const photoValue = norm(photo?.dataUrl || photo?.url || "");
+      const evidenceId = buildStableEvidenceId({
+        visitaId,
+        externalId: actor.profile.external_id,
+        tipoEvento: "EVIDENCIA_OPERATIVA",
+        marcaId,
+        tipoEvidencia,
+        fase,
+        photoValue,
+        photoName,
+      });
+      created.push(evidenceId);
       return {
         evidencia_id: evidenceId,
         external_id: actor.profile.external_id,
@@ -4484,7 +4795,7 @@ app.post("/miniapp/promotor/evidence-register", async (req, res) => {
     });
   } catch (error) {
     console.error("evidence-register error", error);
-    const statusCode = error?.isQuotaExceeded ? 503 : 500;
+    const statusCode = error?.isQuotaExceeded || error?.isEvidenceConfirmationFailure ? 503 : 500;
     return res.status(statusCode).json({ ok: false, error: error.message || "No se pudo registrar la evidencia." });
   }
 });
@@ -4582,7 +4893,16 @@ app.post("/external-camera/upload", async (req, res) => {
     if (tiendaMarcas.length && !tiendaMarcas.some((item) => item.marca_id === marcaId)) {
       return res.status(400).json({ ok: false, error: "La marca seleccionada no corresponde a la tienda de esta visita." });
     }
-    const evidenceId = `EV-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const evidenceId = buildStableEvidenceId({
+      visitaId: payload.visita_id,
+      externalId: payload.external_id,
+      tipoEvento: "EVIDENCIA_OPERATIVA",
+      marcaId,
+      tipoEvidencia,
+      fase: normalizeEvidencePhase(captureContext.fase || payload.fase, "ESTADO_ACTUAL"),
+      photoValue,
+      photoName,
+    });
     const rowPayload = {
       evidencia_id: evidenceId,
       external_id: payload.external_id,
@@ -4632,7 +4952,8 @@ app.post("/external-camera/upload", async (req, res) => {
     });
   } catch (error) {
     console.error("external-camera-upload error", error);
-    return res.status(500).json({ ok: false, error: error.message || "No se pudo subir la evidencia desde cámara externa." });
+    const statusCode = error?.isQuotaExceeded || error?.isEvidenceConfirmationFailure ? 503 : 500;
+    return res.status(statusCode).json({ ok: false, error: error.message || "No se pudo subir la evidencia desde cámara externa." });
   }
 });
 
